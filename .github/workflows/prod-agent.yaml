@@ -4,6 +4,12 @@
 name: prod | build the guest agent
 
 on:
+  # Pushing the branch builds it: workflow_dispatch alone would need this
+  # file on the default branch, which tracks upstream and should not carry
+  # it.
+  push:
+    branches:
+      - 'prod-*'
   workflow_dispatch:
     inputs:
       release:
@@ -87,7 +93,7 @@ jobs:
             glibc.txt
 
       - name: Publish it as a release
-        if: ${{ inputs.release }}
+        if: ${{ github.event_name == 'push' || inputs.release }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
