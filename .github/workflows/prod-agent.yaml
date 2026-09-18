@@ -1,0 +1,108 @@
+# Builds the guest agent this deployment runs, from this branch: the
+# release it is based on plus the patches carried on top. Not an upstream
+# workflow; it exists only on the branches that carry those patches.
+name: prod | build the guest agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Publish the binary as a release
+        type: boolean
+        default: true
+
+permissions: {}
+
+jobs:
+  build:
+    name: build and test
+    # The guest's glibc is the one of its rootfs (Ubuntu noble, 2.39).
+    # A binary built against a newer one does not run there, so the
+    # runner image is pinned rather than taken as latest.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libseccomp-dev \
+            clang protobuf-compiler
+          rustup show active-toolchain
+          rustup component add rustfmt clippy
+
+      - name: Record what this build is
+        id: what
+        run: |
+          echo "commit=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+          ldd --version | head -1
+
+      - name: Check the formatting and the lints
+        working-directory: src/agent
+        run: |
+          make src/version.rs
+          cargo fmt -- --check
+          RUSTFLAGS="--deny warnings" cargo clippy --features seccomp --all-targets -- -D warnings
+
+      # The agent's suite has tests that need mounts, netlink and a real
+      # sandbox; they fail on a runner for the environment, not for the
+      # code. The tests of the patches this branch carries are run here,
+      # and the whole suite is run where it can pass.
+      - name: Test the patches this branch carries
+        working-directory: src/agent
+        run: |
+          cargo test --features seccomp --bin kata-agent -- --nocapture \
+            rpc::tests::test_is_signal \
+            rpc::tests::test_sigset \
+            rpc::tests::test_parse_sigtimedwait
+
+      # The features the deployed agent is built with: `kata-agent
+      # --version` in the guest image prints them, and they must match.
+      - name: Build
+        working-directory: src/agent
+        run: make LIBC=gnu AGENT_POLICY=yes SECCOMP=yes BUILD_TYPE=release
+
+      - name: Describe the binary
+        id: binary
+        run: |
+          set -o pipefail
+          bin=target/x86_64-unknown-linux-gnu/release/kata-agent
+          strip "$bin"
+          install -m 0755 "$bin" kata-agent
+          ./kata-agent --version | tee version.txt
+          objdump -T kata-agent | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1 | tee glibc.txt
+          sha256sum kata-agent | tee kata-agent.sha256
+          echo "sha=$(cut -d' ' -f1 kata-agent.sha256)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kata-agent-${{ steps.what.outputs.commit }}
+          path: |
+            kata-agent
+            kata-agent.sha256
+            version.txt
+            glibc.txt
+
+      - name: Publish it as a release
+        if: ${{ inputs.release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="prod-agent-${{ steps.what.outputs.version }}-${{ steps.what.outputs.commit }}"
+          {
+            echo "Guest agent built from \`${{ github.ref_name }}\` at ${{ github.sha }}."
+            echo
+            echo '```'
+            cat version.txt
+            echo "glibc needed: $(cat glibc.txt)"
+            echo "sha256: ${{ steps.binary.outputs.sha }}"
+            echo '```'
+            echo
+            echo "Built by \`make LIBC=gnu AGENT_POLICY=yes SECCOMP=yes BUILD_TYPE=release\`"
+            echo "on \`ubuntu-24.04\`, which carries the glibc of the guest rootfs."
+          } > notes.md
+          gh release create "$tag" kata-agent kata-agent.sha256 \
+            --title "$tag" --notes-file notes.md --latest=false
