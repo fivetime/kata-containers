@@ -18,7 +18,7 @@ on:
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
       - 'VERSION'
-      - '.github/workflows/fork-guest-agent.yaml'
+      - '.github/workflows/build-guest-agent.yaml'
   workflow_dispatch:
     inputs:
       release:
@@ -29,7 +29,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: fork-guest-agent-${{ github.ref }}
+  group: build-guest-agent-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
