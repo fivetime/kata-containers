@@ -1,7 +1,7 @@
 # Builds the guest agent this deployment runs: upstream plus the patches
 # carried on top of it in this fork. Not an upstream workflow; it exists
 # only in this fork, on main and on the prod-* branches.
-name: prod | build the guest agent
+name: fork | build the guest agent
 
 on:
   # main is built when what goes into the agent changes, so that syncing
@@ -18,7 +18,7 @@ on:
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
       - 'VERSION'
-      - '.github/workflows/prod-agent.yaml'
+      - '.github/workflows/fork-guest-agent.yaml'
   workflow_dispatch:
     inputs:
       release:
@@ -29,7 +29,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: prod-agent-${{ github.ref }}
+  group: fork-guest-agent-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
