@@ -54,11 +54,21 @@ jobs:
           rustup show active-toolchain
           rustup component add rustfmt clippy
 
+      # A commit with a version tag (4.2.0, v4.2.0) is named after the tag;
+      # any other is named after the branch it was built from. The
+      # checkout is shallow and has no tags, so they are asked of the
+      # remote. The release tags this workflow creates are not versions and
+      # do not match.
       - name: Record what this build is
         id: what
         run: |
+          set -o pipefail
+          head=$(git rev-parse HEAD)
+          version=$(git ls-remote --tags origin |
+            awk -v c="$head" '$1 == c { sub("^refs/tags/", "", $2); sub(/\^\{\}$/, "", $2); print $2 }' |
+            { grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+' || true; } | sort -uV | tail -1)
           echo "commit=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-          echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+          echo "label=${version:-${GITHUB_REF_NAME//\//-}}" >> "$GITHUB_OUTPUT"
           ldd --version | head -1
 
       - name: Check the formatting and the lints
@@ -114,7 +124,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="guest-agent-${{ steps.what.outputs.version }}-${{ steps.what.outputs.commit }}"
+          tag="guest-agent-${{ steps.what.outputs.label }}-${{ steps.what.outputs.commit }}"
           {
             echo "Guest agent built from \`${{ github.ref_name }}\` at ${{ github.sha }}."
             echo
@@ -127,5 +137,8 @@ jobs:
             echo "Built by \`make LIBC=gnu AGENT_POLICY=yes SECCOMP=yes BUILD_TYPE=release\`"
             echo "on \`ubuntu-24.04\`, which carries the glibc of the guest rootfs."
           } > notes.md
+          # Without --target the tag would go on the default branch's head
+          # at the time of the release, not on the commit that was built.
           gh release create "$tag" kata-agent kata-agent.sha256 \
+            --target "${{ github.sha }}" \
             --title "$tag" --notes-file notes.md --latest=false
