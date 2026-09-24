@@ -1,15 +1,24 @@
-# Builds the guest agent this deployment runs, from this branch: the
-# release it is based on plus the patches carried on top. Not an upstream
-# workflow; it exists only on the branches that carry those patches.
+# Builds the guest agent this deployment runs: upstream plus the patches
+# carried on top of it in this fork. Not an upstream workflow; it exists
+# only in this fork, on main and on the prod-* branches.
 name: prod | build the guest agent
 
 on:
-  # Pushing the branch builds it: workflow_dispatch alone would need this
-  # file on the default branch, which tracks upstream and should not carry
-  # it.
+  # main is built when what goes into the agent changes, so that syncing
+  # upstream work elsewhere in the tree does not publish a new binary each
+  # time. A prod-* branch is built on every push.
   push:
     branches:
+      - main
       - 'prod-*'
+    paths:
+      - 'src/agent/**'
+      - 'src/libs/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'VERSION'
+      - '.github/workflows/prod-agent.yaml'
   workflow_dispatch:
     inputs:
       release:
@@ -19,9 +28,15 @@ on:
 
 permissions: {}
 
+concurrency:
+  group: prod-agent-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: build and test
+    # Forks of this fork would otherwise publish releases of their own.
+    if: ${{ github.repository == 'fivetime/kata-containers' }}
     # The guest's glibc is the one of its rootfs (Ubuntu noble, 2.39).
     # A binary built against a newer one does not run there, so the
     # runner image is pinned rather than taken as latest.
@@ -64,6 +79,8 @@ jobs:
             rpc::tests::test_is_signal \
             rpc::tests::test_sigset \
             rpc::tests::test_parse_sigtimedwait
+          cargo test -p rustjail --lib -- --nocapture \
+            cgroups::fs::tests::test_memswap_limit_value
 
       # The features the deployed agent is built with: `kata-agent
       # --version` in the guest image prints them, and they must match.
