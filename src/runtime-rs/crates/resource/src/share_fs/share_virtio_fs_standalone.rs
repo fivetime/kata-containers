@@ -189,6 +189,15 @@ pub(crate) fn virtiofsd_base_args(
 
     args.extend(extra_args.iter().cloned());
 
+    // Nova Kata (ADR-052): QEMU live-migrates virtiofsd's state; the
+    // destination finds every inode the guest has open by its path in the
+    // same shared directory, and a migration fails rather than leave the
+    // guest an inode it cannot reach.
+    if !extra_args.iter().any(|arg| arg.starts_with("--migration-")) {
+        args.push(String::from("--migration-mode=find-paths"));
+        args.push(String::from("--migration-on-error=abort"));
+    }
+
     if !disable_guest_selinux {
         args.push(String::from("--xattr"));
     }

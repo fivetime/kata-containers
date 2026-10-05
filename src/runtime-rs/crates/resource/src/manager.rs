@@ -103,6 +103,21 @@ impl ResourceManager {
     }
 
     #[instrument]
+    /// Nova Kata (ADR-052): the sandbox receives a live migration.
+    pub async fn set_incoming(&self, incoming: bool) {
+        self.inner.write().await.set_incoming(incoming);
+    }
+
+    /// Nova Kata (ADR-052): every block device takes its source's index.
+    pub async fn set_block_index_pins(
+        &self,
+        pins: std::collections::HashMap<String, u64>,
+    ) -> Result<()> {
+        let device_manager = self.get_device_manager().await;
+        let mut device_manager = device_manager.write().await;
+        device_manager.set_block_index_pins(pins)
+    }
+
     pub async fn setup_after_start_vm(&self) -> Result<()> {
         let mut inner = self.inner.write().await;
         inner.setup_after_start_vm().await

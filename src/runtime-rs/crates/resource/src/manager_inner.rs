@@ -72,6 +72,9 @@ pub(crate) struct ResourceManagerInner {
     share_fs: Option<Arc<dyn ShareFs>>,
     nydus_share_fs: Option<Arc<dyn NydusShareFs>>,
     nova_shares: NovaShareDaemons,
+    // Nova Kata (ADR-052): the VM receives a live migration; the guest is
+    // configured already and nothing is said to its agent.
+    incoming: bool,
 
     pub rootfs_resource: RootFsResource,
     pub volume_resource: VolumeResource,
@@ -145,6 +148,7 @@ impl ResourceManagerInner {
             share_fs: None,
             nydus_share_fs: None,
             nova_shares: NovaShareDaemons::default(),
+            incoming: false,
             rootfs_resource: RootFsResource::new(),
             volume_resource: VolumeResource::new(),
             cgroups_resource,
@@ -491,11 +495,19 @@ impl ResourceManagerInner {
         Ok(())
     }
 
+    pub fn set_incoming(&mut self, incoming: bool) {
+        self.incoming = incoming;
+    }
+
     pub async fn setup_after_start_vm(&mut self) -> Result<()> {
         self.cgroups_resource
             .setup_after_start_vm(self.hypervisor.as_ref())
             .await
             .context("setup cgroups after start vm")?;
+
+        if self.incoming {
+            return Ok(());
+        }
 
         if let Some(share_fs) = self.share_fs.as_ref() {
             share_fs
@@ -1297,6 +1309,7 @@ impl Persist for ResourceManagerInner {
             share_fs: None,
             nydus_share_fs: None,
             nova_shares: NovaShareDaemons::default(),
+            incoming: false,
             rootfs_resource: RootFsResource::new(),
             volume_resource: VolumeResource::new(),
             cgroups_resource: CgroupsResource::restore(
