@@ -354,6 +354,27 @@ impl DeviceManager {
         self.shared_info.set_block_index_pins(pins)
     }
 
+    /// Nova Kata (ADR-052): the block devices of the sandbox, by host path
+    /// and index, for a migration's manifest; the guest image (a pmem
+    /// device) is the profile's own and is not listed.
+    pub async fn migration_blocks(&self) -> Vec<crate::migration::BlockPin> {
+        let mut pins = Vec::new();
+        for device in self.devices.values() {
+            if let DeviceType::BlockModern(block) = device.lock().await.get_device_info().await {
+                let config = block.lock().await.config.clone();
+                if config.driver_option == *KATA_NVDIMM_DEV_TYPE {
+                    continue;
+                }
+                pins.push(crate::migration::BlockPin {
+                    path: config.path_on_host,
+                    index: config.index,
+                });
+            }
+        }
+        pins.sort_by_key(|pin| pin.index);
+        pins
+    }
+
     fn get_dev_virt_path(
         &mut self,
         dev_type: &str,

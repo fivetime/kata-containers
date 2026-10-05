@@ -159,6 +159,16 @@ impl ContainerInner {
         Ok(())
     }
 
+    /// Nova Kata (ADR-052): the container runs in a guest that arrived by
+    /// a live migration; it is taken over, not started.
+    pub(crate) async fn adopt_container(&mut self) -> Result<()> {
+        self.check_state(vec![ProcessStatus::Created])
+            .await
+            .context("check state")?;
+        self.set_state(ProcessStatus::Running).await;
+        Ok(())
+    }
+
     async fn get_exit_status(&self) -> Arc<RwLock<ProcessExitStatus>> {
         self.init_process.exit_status.clone()
     }

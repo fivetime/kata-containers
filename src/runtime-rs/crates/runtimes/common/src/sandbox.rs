@@ -61,4 +61,26 @@ pub trait Sandbox: Send + Sync {
 
     // set agent policy
     async fn set_policy(&self, policy: &str) -> Result<()>;
+
+    // Nova Kata (ADR-052): live migration.
+    /// A task update that is a migration action of the sandbox: done, and
+    /// true; any other update: false, untouched.
+    async fn migration_update(&self, _req: &crate::types::UpdateRequest) -> Result<bool> {
+        Ok(false)
+    }
+    /// Once the sandbox container is created: a sandbox that receives a VM
+    /// begins receiving. Nothing otherwise.
+    async fn migration_receive(&self) -> Result<()> {
+        Ok(())
+    }
+    /// Before the sandbox container starts: a sandbox that received a VM
+    /// waits for the transfer's end, resumes it and redials its agent.
+    /// Nothing otherwise.
+    async fn migration_finish(&self) -> Result<()> {
+        Ok(())
+    }
+    /// Whether the sandbox received a VM whose container runs already.
+    async fn migrated_in(&self) -> bool {
+        false
+    }
 }

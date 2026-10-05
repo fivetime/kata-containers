@@ -11,6 +11,7 @@ logging::logger_with_subsystem!(sl, "virt-container");
 
 mod cleanup_once;
 mod container_manager;
+mod live_migration;
 pub mod factory;
 pub mod health_check;
 pub mod oom;

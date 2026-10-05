@@ -94,6 +94,11 @@ pub trait Agent: AgentManager + HealthService + Send + Sync {
 
     // utils
     async fn copy_file(&self, req: CopyFileRequest) -> Result<Empty>;
+    /// Nova Kata (ADR-052): set the guest's clock, which nothing in the
+    /// guest keeps after a live migration.
+    async fn set_guest_date_time(&self, _req: SetGuestDateTimeRequest) -> Result<Empty> {
+        Err(anyhow::anyhow!("set_guest_date_time is not implemented by this agent"))
+    }
     async fn get_metrics(&self, req: Empty) -> Result<MetricsResponse>;
     async fn get_oom_event(&self, req: Empty) -> Result<OomEventResponse>;
     async fn get_ip_tables(&self, req: GetIPTablesRequest) -> Result<GetIPTablesResponse>;

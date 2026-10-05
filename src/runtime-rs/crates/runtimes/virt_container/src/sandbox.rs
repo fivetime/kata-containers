@@ -150,7 +150,23 @@ pub struct VirtSandbox {
     factory: Option<Factory>,
     cancel_token: CancellationToken,
     oom_notifier: Arc<CrioOomNotifier>,
+    migration: Arc<Mutex<MigrationState>>,
 }
+
+/// Nova Kata (ADR-052): a live migration of this sandbox's VM.
+#[derive(Default)]
+struct MigrationState {
+    /// The sandbox received a VM, or receives it.
+    incoming: Option<hypervisor::migration::MigrateIn>,
+    received: bool,
+    finished: bool,
+    /// The sandbox sends its VM.
+    sending: bool,
+}
+
+/// How long a destination waits, once told to finish, for its VMM to have
+/// the whole VM: the source said the transfer completed before.
+const MIGRATION_FINISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 impl std::fmt::Debug for VirtSandbox {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -198,6 +214,7 @@ impl VirtSandbox {
             factory: Some(factory),
             cancel_token,
             oom_notifier: Arc::new(CrioOomNotifier::default()),
+            migration: Arc::new(Mutex::new(MigrationState::default())),
         })
     }
 
@@ -746,6 +763,86 @@ impl VirtSandbox {
         Ok(configs)
     }
 
+    /// Nova Kata (ADR-052): write how the transfer stands until it ends.
+    /// A VM that stays (the transfer failed or was cancelled) is checked
+    /// again; one that left keeps its health check suspended.
+    async fn follow_migration(&self, path: String) {
+        loop {
+            match self.hypervisor.migration_progress().await {
+                Ok(progress) => {
+                    if let Err(err) = crate::live_migration::write_json(&path, &progress) {
+                        warn!(sl!(), "write the migration's status: {:?}", err);
+                    }
+                    if progress.ended() {
+                        if progress.status != "completed" {
+                            self.monitor.resume();
+                            self.migration.lock().await.sending = false;
+                        }
+                        info!(sl!(), "migration of {} ended: {}", self.sid, progress.status);
+                        return;
+                    }
+                }
+                Err(err) => {
+                    warn!(sl!(), "query the migration: {:?}", err);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+
+    fn spawn_oom_watcher(&self) {
+        let agent = self.agent.clone();
+        let sender = self.msg_sender.clone();
+        let cancel_token = self.cancel_token.clone();
+        let oom_notifier = self.oom_notifier.clone();
+
+        info!(sl!(), "oom watcher start");
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        // Sandbox or VM is shutting down, gracefully exit watcher
+                        info!(sl!(), "oom watcher cancelled, sandbox is stopping");
+                        break;
+                    }
+                    res = agent.get_oom_event(agent::Empty::new()) => {
+                        match res.context("get oom event") {
+                            Ok(resp) => {
+                                let cid = &resp.container_id;
+                                warn!(sl!(), "send oom event for container {}", &cid);
+                                // CRI-O reads a file rather than the event below.
+                                oom_notifier.notify(cid).await;
+                                let event = TaskOOM {
+                                    container_id: cid.to_string(),
+                                    ..Default::default()
+                                };
+                                let msg = Message::new(Action::Event(Arc::new(event)));
+                                let lock_sender = sender.lock().await;
+                                if let Err(err) = lock_sender.send(msg).await.context("send event") {
+                                    error!(
+                                        sl!(),
+                                        "failed to send oom event for {} error {:?}", cid, err
+                                    );
+                                }
+                            }
+                            Err(err) => {
+                                // Handle errors by type
+                                if is_normal_oom_shutdown_error(&err) {
+                                    info!(sl!(), "oom watcher exit on sandbox shutdown: {:?}", err);
+                                    break;
+                                } else {
+                                    warn!(sl!(), "failed to get oom event error {:?}", err);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+    }
+
     async fn set_agent_policy(&self) -> Result<()> {
         // TODO: Exclude policy-related items from the annotations.
         let toml_config = self.resource_manager.config().await;
@@ -1025,6 +1122,160 @@ fn oci_spec_vfio_device_paths() -> Vec<String> {
 
 #[async_trait]
 impl Sandbox for VirtSandbox {
+    async fn migration_update(&self, req: &common::types::UpdateRequest) -> Result<bool> {
+        let Some(update) = crate::live_migration::parse(req)? else {
+            return Ok(false);
+        };
+        if req.container_id != self.sid {
+            return Err(anyhow!("migration_invalid: only the sandbox container migrates"));
+        }
+        let config = self
+            .sandbox_config
+            .as_ref()
+            .context("sandbox config is missing")?;
+        crate::live_migration::validate_generation(&update, &config.annotations)?;
+        if !self.hypervisor.supports_live_migration() {
+            return Err(anyhow!(
+                "migration_unsupported: this hypervisor does not live-migrate"
+            ));
+        }
+        match update.action.as_str() {
+            "manifest" => {
+                let device_manager = self.resource_manager.get_device_manager().await;
+                let blocks = device_manager.read().await.migration_blocks().await;
+                let networks = self.hypervisor.migration_networks().await?;
+                let manifest = hypervisor::migration::DeviceManifest {
+                    version: 1,
+                    vmm: self.resource_manager.config().await.runtime.hypervisor_name.clone(),
+                    blocks,
+                    networks,
+                };
+                crate::live_migration::write_json(
+                    update.path.as_deref().unwrap_or_default(),
+                    &manifest,
+                )?;
+            }
+            "send" => {
+                let mut state = self.migration.lock().await;
+                if state.incoming.is_some() && !state.finished {
+                    return Err(anyhow!(
+                        "migration_invalid: the sandbox has not received its own VM"
+                    ));
+                }
+                if state.sending {
+                    return Err(anyhow!("migration_invalid: a migration is under way"));
+                }
+                let params = hypervisor::migration::MigrationParams {
+                    downtime_ms: update.downtime_ms.unwrap_or(0),
+                    max_bandwidth: update.max_bandwidth.unwrap_or(0),
+                };
+                // The agent stops answering when the VM leaves: the health
+                // check must not end the shim meanwhile.
+                self.monitor.suspend();
+                if let Err(err) = self
+                    .hypervisor
+                    .migration_send(update.uri.as_deref().unwrap_or_default(), &params)
+                    .await
+                {
+                    self.monitor.resume();
+                    return Err(err);
+                }
+                state.sending = true;
+                let path = update.path.clone().unwrap_or_default();
+                let sandbox = self.clone();
+                tokio::spawn(async move {
+                    sandbox.follow_migration(path).await;
+                });
+            }
+            "cancel" => {
+                if !self.migration.lock().await.sending {
+                    return Err(anyhow!("migration_invalid: no migration is under way"));
+                }
+                self.hypervisor.migration_cancel().await?;
+            }
+            _ => return Err(anyhow!("migration_unsupported: action")),
+        }
+        Ok(true)
+    }
+
+    async fn migration_receive(&self) -> Result<()> {
+        let mut state = self.migration.lock().await;
+        if state.incoming.is_none() || state.received {
+            return Ok(());
+        }
+        self.hypervisor
+            .migration_receive()
+            .await
+            .context("receive the VM")?;
+        state.received = true;
+        info!(sl!(), "sandbox {} receives its VM", self.sid);
+        Ok(())
+    }
+
+    async fn migration_finish(&self) -> Result<()> {
+        let mut state = self.migration.lock().await;
+        if state.incoming.is_none() || state.finished {
+            return Ok(());
+        }
+        if !state.received {
+            return Err(anyhow!("migration_invalid: the VM was never received"));
+        }
+        let deadline = tokio::time::Instant::now() + MIGRATION_FINISH_TIMEOUT;
+        loop {
+            let progress = self.hypervisor.migration_progress().await?;
+            match progress.status.as_str() {
+                "completed" => break,
+                "failed" | "cancelled" => {
+                    return Err(anyhow!(
+                        "migration_failed: the transfer ended {}: {}",
+                        progress.status,
+                        progress.error
+                    ));
+                }
+                _ => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(anyhow!("migration_failed: the transfer did not end in time"));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        self.hypervisor.resume_vm().await.context("resume the VM")?;
+        let address = self
+            .hypervisor
+            .get_agent_socket()
+            .await
+            .context("get agent socket")?;
+        self.agent
+            .start(&address)
+            .await
+            .context(format!("connect to address {:?}", &address))?;
+        self.set_agent_policy().await.context("set agent policy")?;
+        // Nothing in the guest keeps its clock across the migration.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("the host's clock")?;
+        self.agent
+            .set_guest_date_time(agent::SetGuestDateTimeRequest {
+                sec: now.as_secs() as i64,
+                usec: now.subsec_micros() as i64,
+            })
+            .await
+            .context("set the guest's clock")?;
+        self.resource_manager.set_incoming(false).await;
+        self.store_guest_details()
+            .await
+            .context("failed to store guest details")?;
+        self.spawn_oom_watcher();
+        self.monitor.start(&self.sid, self.agent.clone());
+        state.finished = true;
+        info!(sl!(), "sandbox {} resumed its VM", self.sid);
+        Ok(())
+    }
+
+    async fn migrated_in(&self) -> bool {
+        self.migration.lock().await.incoming.is_some()
+    }
+
     #[instrument(name = "sb: start")]
     async fn start(&self) -> Result<()> {
         let id = &self.sid;
@@ -1044,6 +1295,22 @@ impl Sandbox for VirtSandbox {
         }
         // A share request is refused before the VM is prepared (ADR-045).
         self.nova_shares(sandbox_config).await?;
+
+        // Nova Kata (ADR-052): a sandbox asked to receive a VM never boots
+        // one. Every block device takes its source's index.
+        let incoming = hypervisor::migration::migrate_in(&sandbox_config.annotations)?;
+        if let Some(incoming) = incoming.as_ref() {
+            if !self.hypervisor.supports_live_migration() {
+                return Err(anyhow!(
+                    "migration_unsupported: this hypervisor does not live-migrate"
+                ));
+            }
+            self.resource_manager.set_incoming(true).await;
+            self.resource_manager
+                .set_block_index_pins(incoming.block_pins())
+                .await
+                .context("pin the block devices")?;
+        }
 
         let selinux_label = load_oci_spec().ok().and_then(|spec| {
             spec.process()
@@ -1146,6 +1413,21 @@ impl Sandbox for VirtSandbox {
                 .await?;
         }
 
+        // Nova Kata (ADR-052): the guest that arrives runs its agent and
+        // its container already; they are reached once it is resumed.
+        if let Some(incoming) = incoming {
+            self.resource_manager
+                .setup_after_start_vm()
+                .await
+                .context("setup device after start vm")?;
+            inner.state = SandboxState::Running;
+            inner.created_at = Some(std::time::SystemTime::now());
+            self.migration.lock().await.incoming = Some(incoming);
+            info!(sl!(), "sandbox {} waits for its VM", id);
+            self.save().await.context("save state")?;
+            return Ok(());
+        }
+
         // connect agent
         // set agent socket
         let address = self
@@ -1199,55 +1481,7 @@ impl Sandbox for VirtSandbox {
             .await
             .context("failed to store guest details")?;
 
-        let agent = self.agent.clone();
-        let sender = self.msg_sender.clone();
-        let cancel_token = self.cancel_token.clone();
-        let oom_notifier = self.oom_notifier.clone();
-
-        info!(sl!(), "oom watcher start");
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = cancel_token.cancelled() => {
-                        // Sandbox or VM is shutting down, gracefully exit watcher
-                        info!(sl!(), "oom watcher cancelled, sandbox is stopping");
-                        break;
-                    }
-                    res = agent.get_oom_event(agent::Empty::new()) => {
-                        match res.context("get oom event") {
-                            Ok(resp) => {
-                                let cid = &resp.container_id;
-                                warn!(sl!(), "send oom event for container {}", &cid);
-                                // CRI-O reads a file rather than the event below.
-                                oom_notifier.notify(cid).await;
-                                let event = TaskOOM {
-                                    container_id: cid.to_string(),
-                                    ..Default::default()
-                                };
-                                let msg = Message::new(Action::Event(Arc::new(event)));
-                                let lock_sender = sender.lock().await;
-                                if let Err(err) = lock_sender.send(msg).await.context("send event") {
-                                    error!(
-                                        sl!(),
-                                        "failed to send oom event for {} error {:?}", cid, err
-                                    );
-                                }
-                            }
-                            Err(err) => {
-                                // Handle errors by type
-                                if is_normal_oom_shutdown_error(&err) {
-                                    info!(sl!(), "oom watcher exit on sandbox shutdown: {:?}", err);
-                                    break;
-                                } else {
-                                    warn!(sl!(), "failed to get oom event error {:?}", err);
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        });
+        self.spawn_oom_watcher();
 
         self.monitor.start(id, self.agent.clone());
         self.save().await.context("save state")?;
@@ -1717,6 +1951,7 @@ impl Persist for VirtSandbox {
             // A restored sandbox is handed back its containers by the shim, so
             // this starts out empty and fills up as they are created again.
             oom_notifier: Arc::new(CrioOomNotifier::default()),
+            migration: Arc::new(Mutex::new(MigrationState::default())),
         })
     }
 }

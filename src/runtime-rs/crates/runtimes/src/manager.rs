@@ -538,6 +538,13 @@ impl RuntimeHandlerManager {
                 .create_container(container_config, spec)
                 .await
                 .context("create container")?;
+            // Nova Kata (ADR-052): with its devices in place, a sandbox
+            // that receives a VM begins receiving.
+            instance
+                .sandbox
+                .migration_receive()
+                .await
+                .context("receive the VM")?;
 
             let container_manager = instance.container_manager.clone();
             let process_id =
@@ -719,6 +726,14 @@ impl RuntimeHandlerManager {
                 Ok(TaskResponse::WaitProcess(exit_status))
             }
             TaskRequest::StartProcess(process_id) => {
+                // Nova Kata (ADR-052): the VM that arrived is resumed and its
+                // agent reached before its container is taken over.
+                if process_id.process_type == ProcessType::Container {
+                    sandbox
+                        .migration_finish()
+                        .await
+                        .context("finish the migration")?;
+                }
                 // Docker 26+ configures the veth between the Create and Start
                 // RPCs.  Rescan now so interfaces are wired before the process
                 // starts.  The rescan uses a lightweight netlink probe during
@@ -795,6 +810,14 @@ impl RuntimeHandlerManager {
                 Ok(TaskResponse::StatsContainer(stats))
             }
             TaskRequest::UpdateContainer(req) => {
+                // Nova Kata (ADR-052): an action of a live migration.
+                if sandbox
+                    .migration_update(&req)
+                    .await
+                    .context("migration update")?
+                {
+                    return Ok(TaskResponse::UpdateContainer);
+                }
                 cm.update_container(req).await.context("update container")?;
                 Ok(TaskResponse::UpdateContainer)
             }

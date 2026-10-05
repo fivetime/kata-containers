@@ -178,8 +178,12 @@ impl Container {
         }
         inner.rootfs.push(rootfs);
 
+        // Nova Kata (ADR-052): the container of a guest that arrives by a
+        // live migration runs in it already: its devices are placed on the
+        // host as on the source, and nothing is said to its agent.
+        let migrated_in = migrated_in(&self.spec);
         let initial = super::live_volume_created::parse_initial(&config.container_id, &self.spec)?;
-        if !initial.is_empty() {
+        if !initial.is_empty() && !migrated_in {
             let details = self.agent.get_guest_details(agent::GetGuestDetailsRequest::default()).await?;
             let dm = self.resource_manager.get_device_manager().await;
             let block = hypervisor::device::device_manager::get_block_device_info(&dm).await;
@@ -321,10 +325,17 @@ impl Container {
             ..Default::default()
         };
 
-        self.agent
-            .create_container(r)
-            .await
-            .context("agent create container")?;
+        if migrated_in {
+            info!(
+                sl!(),
+                "container {} is in the guest that arrives", &config.container_id
+            );
+        } else {
+            self.agent
+                .create_container(r)
+                .await
+                .context("agent create container")?;
+        }
         self.resource_manager.dump().await;
         Ok(())
     }
@@ -338,7 +349,11 @@ impl Container {
         match process.process_type {
             ProcessType::Container => {
                 let res: Result<()> = async {
-                    inner.start_container(&process.container_id).await?;
+                    if migrated_in(&self.spec) {
+                        inner.adopt_container().await?;
+                    } else {
+                        inner.start_container(&process.container_id).await?;
+                    }
 
                     if process_uses_passfd_io(&inner, process)? {
                         inner
@@ -1543,4 +1558,12 @@ impl Container {
             None => self.resource_manager.refresh_network().await,
         }
     }
+}
+
+/// Nova Kata (ADR-052): the spec asks the sandbox to receive a VM.
+fn migrated_in(spec: &oci::Spec) -> bool {
+    spec.annotations()
+        .as_ref()
+        .map(|annotations| annotations.contains_key(hypervisor::migration::MIGRATE_IN_KEY))
+        .unwrap_or(false)
 }

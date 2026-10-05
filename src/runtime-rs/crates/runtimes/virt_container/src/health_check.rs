@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,6 +25,38 @@ pub struct HealthCheck {
     // A token rather than a channel: stop() may run more than once, e.g. from
     // concurrent sandbox stops and again from shutdown, and must never block.
     stop_token: CancellationToken,
+    // Nova Kata (ADR-052): while a VM leaves for another host its agent
+    // stops answering; checks pass until the migration ends, and the VM
+    // that stays is checked again.
+    suspended: Arc<AtomicBool>,
+}
+
+/// The agent's probe, which passes while the health check is suspended,
+/// also for a check that was in flight when the suspension began.
+struct SuspendableProbe {
+    agent: Arc<dyn Agent>,
+    suspended: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl HealthProbe for SuspendableProbe {
+    async fn check(&self) -> Result<()> {
+        if self.suspended.load(AtomicOrdering::SeqCst) {
+            return Ok(());
+        }
+        let result = HealthProbe::check(&self.agent).await;
+        if result.is_err() && self.suspended.load(AtomicOrdering::SeqCst) {
+            return Ok(());
+        }
+        result
+    }
+
+    async fn version(&self) -> Result<String> {
+        if self.suspended.load(AtomicOrdering::SeqCst) {
+            return Ok(String::new());
+        }
+        HealthProbe::version(&self.agent).await
+    }
 }
 
 /// Why the health check loop ended.
@@ -67,7 +100,18 @@ impl HealthCheck {
             keep_alive,
             keep_abnormal,
             stop_token: CancellationToken::new(),
+            suspended: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Nova Kata (ADR-052): checks pass from now on.
+    pub fn suspend(&self) {
+        self.suspended.store(true, AtomicOrdering::SeqCst);
+    }
+
+    /// Nova Kata (ADR-052): checks count again.
+    pub fn resume(&self) {
+        self.suspended.store(false, AtomicOrdering::SeqCst);
     }
 
     pub fn start(&self, id: &str, agent: Arc<dyn Agent>) {
@@ -80,9 +124,13 @@ impl HealthCheck {
 
         let stop_token = self.stop_token.clone();
         let keep_abnormal = self.keep_abnormal;
+        let probe = SuspendableProbe {
+            agent,
+            suspended: self.suspended.clone(),
+        };
         tokio::spawn(async move {
             let interval = Duration::from_secs(HEALTH_CHECK_TIMER_INTERVAL);
-            if run_monitor(&id, &agent, &stop_token, keep_abnormal, interval).await
+            if run_monitor(&id, &probe, &stop_token, keep_abnormal, interval).await
                 == MonitorExit::Unhealthy
             {
                 ::std::process::exit(1);
