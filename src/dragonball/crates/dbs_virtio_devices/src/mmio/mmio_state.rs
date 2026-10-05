@@ -400,6 +400,21 @@ where
         }
     }
 
+    /// Nova Kata (ADR-044): what a device that leaves a running VM gives
+    /// back to it. The guest's driver resets the device it releases. A
+    /// backend that knows no reset, as vhost-net, stays activated then, and
+    /// its ioevents stayed registered with KVM when the device was removed:
+    /// the device that was given the same addresses next could not be
+    /// activated (EEXIST), and the guest had an interface that sent nothing.
+    pub(crate) fn release(&mut self) {
+        self.device_activated = false;
+        if let Err(e) = self.intr_mgr.reset() {
+            warn!("the interrupts of a removed device were not reset: {e:?}");
+        }
+        self.unregister_ioevent_doorbell();
+        self.unregister_ioevent();
+    }
+
     pub(crate) fn reset(&mut self) -> Result<()> {
         if self.device_activated {
             warn!("reset device while it's still in active state");

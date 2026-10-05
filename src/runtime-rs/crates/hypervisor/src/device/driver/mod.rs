@@ -12,6 +12,7 @@ mod vhost_user;
 pub mod vhost_user_blk;
 mod vhost_user_net;
 pub mod virtio_blk_modern;
+pub mod volume_qos;
 mod virtio_fs;
 mod virtio_net;
 mod virtio_vsock;
@@ -36,6 +37,7 @@ pub use virtio_blk_modern::{
     BlockConfigModern, BlockDeviceAio, BlockDeviceModern, BlockDeviceModernHandle, VmdkConfig,
     VmdkExtent, VIRTIO_BLOCK_CCW, VIRTIO_BLOCK_MMIO, VIRTIO_BLOCK_PCI, VIRTIO_PMEM,
 };
+pub use volume_qos::{refuse_volume_qos, BlockIoLimits, VOLUME_QOS_PREFIX};
 pub use virtio_fs::{
     ShareFsConfig, ShareFsDevice, ShareFsMountConfig, ShareFsMountOperation, ShareFsMountType,
 };

@@ -143,7 +143,11 @@ where
 
     /// Removes device.
     pub fn remove(&self) {
-        self.state().get_inner_device_mut().remove();
+        let mut state = self.state();
+        // The backend first: it holds what the interrupts are sent by.
+        state.get_inner_device_mut().remove();
+        // Nova Kata (ADR-044).
+        state.release();
     }
 
     /// Returns the Resource.
@@ -576,6 +580,8 @@ pub(crate) mod tests {
         state: Mutex<VirtioDeviceInfo>,
         config: Mutex<Option<VirtioDeviceConfig<Arc<GuestMemoryMmap>>>>,
         ctrl_queue_size: u16,
+        // Nova Kata (ADR-044): a backend that knows no reset, as vhost-net.
+        resets: bool,
     }
 
     impl MmioDevice {
@@ -592,6 +598,7 @@ pub(crate) mod tests {
                 state: Mutex::new(state),
                 config: Mutex::new(None),
                 ctrl_queue_size,
+                resets: true,
             }
         }
     }
@@ -627,7 +634,11 @@ pub(crate) mod tests {
         }
 
         fn reset(&mut self) -> ActivateResult {
-            Ok(())
+            if self.resets {
+                Ok(())
+            } else {
+                Err(crate::ActivateError::InternalError)
+            }
         }
 
         fn set_resource(
@@ -1229,6 +1240,81 @@ pub(crate) mod tests {
         // but device don't support reactivate now
         d.state().deactivate();
         assert!(!d.state().device_activated());
+    }
+
+    // Nova Kata (ADR-044).
+    #[test]
+    fn nova_live_network_a_removed_device_gives_its_addresses_back() {
+        skip_if_kvm_unaccessable!();
+        let kvm = Kvm::new().unwrap();
+        let vm_fd = Arc::new(kvm.create_vm().unwrap());
+        vm_fd.create_irq_chip().unwrap();
+        let irq_manager: Arc<Box<dyn InterruptManager>> =
+            Arc::new(Box::new(KvmIrqManager::new(vm_fd.clone())));
+        irq_manager.initialize().unwrap();
+        // Devices of one VM, one after another at the same addresses.
+        let device = |resets: bool| {
+            let mem =
+                Arc::new(GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap());
+            let mut backend = MmioDevice::new(0);
+            backend.resets = resets;
+            MmioV2Device::new(
+                vm_fd.clone(),
+                mem,
+                create_address_space(),
+                irq_manager.clone(),
+                Box::new(backend),
+                get_device_resource(false, false),
+                None,
+            )
+            .unwrap()
+        };
+        let ready = |d: &mut MmioV2Device<Arc<GuestMemoryMmap>, QueueSync, GuestRegionMmap>| {
+            set_driver_status(d, DEVICE_ACKNOWLEDGE);
+            set_driver_status(d, DEVICE_ACKNOWLEDGE | DEVICE_DRIVER);
+            set_driver_status(d, DEVICE_ACKNOWLEDGE | DEVICE_DRIVER | DEVICE_FEATURES_OK);
+            let mut buf = [0; 4];
+            let size = d.state().queues().len();
+            for q in 0..size {
+                d.state().set_queue_select(q as u32);
+                LittleEndian::write_u32(&mut buf[..], 16);
+                d.write(IoAddress(0), IoAddress(REG_MMIO_QUEUE_NUM), &buf[..]);
+                LittleEndian::write_u32(&mut buf[..], 1);
+                d.write(IoAddress(0), IoAddress(REG_MMIO_QUEUE_READY), &buf[..]);
+            }
+            set_driver_status(
+                d,
+                DEVICE_ACKNOWLEDGE | DEVICE_DRIVER | DEVICE_FEATURES_OK | DEVICE_DRIVER_OK,
+            );
+            d.state().device_activated()
+        };
+
+        let mut leaving = device(false);
+        assert!(ready(&mut leaving));
+        // The guest's driver resets the device it releases; this backend
+        // knows no reset and stays as it is.
+        set_driver_status(&mut leaving, 0);
+        assert!(leaving.state().device_activated());
+        // While it is there no other device has its addresses.
+        let mut early = device(true);
+        assert!(!ready(&mut early));
+        assert_ne!(early.driver_status() & DEVICE_FAILED, 0);
+
+        leaving.remove();
+        assert!(!leaving.state().device_activated());
+        let mut arriving = device(true);
+        assert!(ready(&mut arriving));
+        assert_eq!(arriving.driver_status() & DEVICE_FAILED, 0);
+        // A device that was reset by its backend leaves as before.
+        set_driver_status(&mut arriving, 0);
+        assert!(!arriving.state().device_activated());
+        arriving.remove();
+        let mut next = device(false);
+        assert!(ready(&mut next));
+        // Removed twice is removed.
+        next.remove();
+        next.remove();
+        assert!(!next.state().device_activated());
     }
 
     #[test]

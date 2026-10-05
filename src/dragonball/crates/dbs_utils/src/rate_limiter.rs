@@ -156,13 +156,24 @@ impl TokenBucket {
     fn auto_replenish(&mut self) {
         // Compute time passed since last refill/update.
         let time_delta = self.last_update.elapsed().as_nanos() as u64;
-        self.last_update = Instant::now();
 
         // At each 'time_delta' nanoseconds the bucket should refill with:
         // refill_amount = (time_delta * size) / (complete_refill_time_ms * 1_000_000)
         // `processed_capacity` and `processed_refill_time` are the result of simplifying above
         // fraction formula with their greatest-common-factor.
         let tokens = (time_delta * self.processed_capacity) / self.processed_refill_time;
+        // openstack-nova-kata ADR-051: only the time that made the tokens is
+        // spent, as Firecracker does. Restarting the clock at every call lost
+        // the rest: a bucket that gains less than a token in the 10 ms of the
+        // refill timer, under 100 operations a second, never refilled once
+        // empty, and its device stopped for good. The time is rounded up, so
+        // that no part of a nanosecond makes two tokens.
+        let used = tokens * self.processed_refill_time;
+        let mut adjustment = used / self.processed_capacity;
+        if used % self.processed_capacity != 0 {
+            adjustment += 1;
+        }
+        self.last_update += Duration::from_nanos(adjustment);
         self.budget = std::cmp::min(self.budget + tokens, self.size);
     }
 
@@ -533,6 +544,23 @@ impl Default for RateLimiter {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nova_volume_qos_a_slow_bucket_refills() {
+        // 50 tokens a second: one in 20 ms, refilled every 10 ms.
+        let mut bucket = TokenBucket::new(50, 0, 1000);
+        assert_eq!(bucket.reduce(50), BucketReduction::Success);
+        let mut gained = 0;
+        let began = Instant::now();
+        while began.elapsed() < Duration::from_millis(400) {
+            std::thread::sleep(Duration::from_millis(10));
+            if bucket.reduce(1) == BucketReduction::Success {
+                gained += 1;
+            }
+        }
+        // About 20 in 400 ms; the old clock gave none.
+        assert!((15..=21).contains(&gained), "gained {}", gained);
+    }
+
     use super::*;
     use std::thread;
     use std::time::Duration;

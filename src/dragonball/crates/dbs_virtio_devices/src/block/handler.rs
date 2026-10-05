@@ -427,6 +427,24 @@ impl<AS: DbsGuestAddressSpace, Q: QueueT> EpollHelperHandler for InnerBlockEpoll
                             );
                             self.get_patch_rate_limiters(bytes, ops);
                         }
+                        KillEvent::Resize(requested, reply) => {
+                            let result = self
+                                .disk_image
+                                .refresh_capacity()
+                                .map_err(|e| e.to_string())
+                                .and_then(|capacity| {
+                                    if capacity == requested {
+                                        Ok(capacity)
+                                    } else {
+                                        Err(format!(
+                                            "backend capacity {} is not the requested {}",
+                                            capacity, requested
+                                        ))
+                                    }
+                                });
+                            info!("virtio-blk: capacity refreshed: {:?}", result);
+                            let _ = reply.send(result);
+                        }
                     }
                 }
             }

@@ -178,15 +178,28 @@ impl Container {
         }
         inner.rootfs.push(rootfs);
 
+        let initial = super::live_volume_created::parse_initial(&config.container_id, &self.spec)?;
+        if !initial.is_empty() {
+            let details = self.agent.get_guest_details(agent::GetGuestDetailsRequest::default()).await?;
+            let dm = self.resource_manager.get_device_manager().await;
+            let block = hypervisor::device::device_manager::get_block_device_info(&dm).await;
+            super::live_volume_created::validate_capability(&details, &block.block_device_driver)?;
+        }
+        let initial = super::live_volume_created::audit_initial(initial)?;
         // handler volumes
         let volumes = self
             .resource_manager
             .handler_volumes(&config.container_id, &spec)
             .await
             .context("handler volumes")?;
+        inner.volumes.extend(volumes.iter().cloned());
+        let created = super::live_volume_created::bind_initial(initial, &volumes)?;
         let mut oci_mounts = vec![];
         for v in volumes {
             let mut volume_mounts = v.get_volume_mount().context("get volume mount")?;
+            if volume_mounts.iter().any(|m| m.destination().to_str().is_some_and(|d| created.destinations.contains(d))) {
+                continue;
+            }
             if !volume_mounts.is_empty() {
                 oci_mounts.append(&mut volume_mounts);
             }
@@ -195,7 +208,6 @@ impl Container {
             if !s.is_empty() {
                 storages.append(&mut s);
             }
-            inner.volumes.push(v);
         }
         spec.set_mounts(Some(oci_mounts));
 
@@ -208,8 +220,9 @@ impl Container {
             .resource_manager
             .handler_devices(&config.container_id, linux)
             .await?;
-        let devices_agent = annotate_container_devices(&mut spec, container_devices)
+        let mut devices_agent = annotate_container_devices(&mut spec, container_devices)
             .context("annotate container devices failed")?;
+        created.apply(&mut spec, &mut devices_agent, &mut inner.live_volumes)?;
 
         // update vcpus, mems and host cgroups
         let resources = self
@@ -674,6 +687,9 @@ impl Container {
 
     pub async fn resume(&self) -> Result<()> {
         let mut inner = self.inner.write().await;
+        if inner.live_volumes.values().any(|v| v.detach.as_ref().is_some_and(|d| !d.complete)) {
+            return Err(anyhow!("volume_update_pending: detach must finish before external resume"));
+        }
         let status = inner.init_process.get_status().await;
         if status != ProcessStatus::Paused {
             warn!(
@@ -1218,5 +1234,313 @@ mod tests {
             linux.devices().is_none(),
             "Should remain None when no devices"
         );
+    }
+}
+
+impl Container {
+    pub async fn attach_live_volume(&self, request: super::live_volume::BlockAttach) -> Result<()> {
+        if request.action == "detach" { return self.detach_live_volume(request).await; }
+        use super::live_volume::{PendingVolume, validate_metadata, validate_generation, validate_agent_capability};
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        validate_generation(&request, &self.spec)?;
+        let mut inner = self.inner.write().await;
+        inner.check_state(vec![ProcessStatus::Running, ProcessStatus::Paused]).await?;
+        if inner.live_growth.contains_key(&request.request_id) {
+            return Err(anyhow!("volume_update_conflict: ID already used for growth"));
+        }
+        let paused = inner.init_process.get_status().await == ProcessStatus::Paused;
+        // Capability absence, an old guest, or a failed query must stop before
+        // native device insertion, request reservation or guest mutation.
+        let details = self.agent.get_guest_details(agent::GetGuestDetailsRequest::default()).await?;
+        let device_manager = self.resource_manager.get_device_manager().await;
+        let config = hypervisor::device::device_manager::get_block_device_info(&device_manager).await;
+        validate_agent_capability(&details, &config.block_device_driver)?;
+        if paused {
+            super::live_volume::validate_paused_verification(
+                inner.live_volumes.get(&request.request_id), &request, &details)?;
+        }
+        let metadata = resource::volume::direct_volumes::volume_mount_info(&request.source)?;
+        validate_metadata(&request, &metadata)?;
+        let host = std::fs::symlink_metadata(&metadata.device)?;
+        let number = format!("{}:{}", libc::major(host.rdev()), libc::minor(host.rdev()));
+        if !host.file_type().is_block_device()
+            || metadata.metadata.get("openstack.device_number") != Some(&number) {
+            return Err(anyhow!("volume_update_conflict: host device identity differs"));
+        }
+        // Compare the parsed record on replay without depending on HashMap order.
+        let metadata_identity = serde_json::to_value(&metadata)?;
+        if let Some(prior) = inner.live_volumes.get(&request.request_id) {
+            if prior.detach.is_some() { return Err(anyhow!("volume_update_conflict: original attach is detaching or detached")); }
+            if prior.request != request || prior.metadata_identity != metadata_identity {
+                return Err(anyhow!("volume_update_conflict: request ID reused"));
+            }
+        } else {
+            if inner.live_volumes.values().any(|v| !v.detach.as_ref().is_some_and(|d| d.complete)
+                && (v.request.destination == request.destination || v.request.volume_uuid == request.volume_uuid))
+                || self.spec.mounts().as_ref().is_some_and(|mounts| mounts.iter()
+                    .any(|m| m.destination().to_str() == Some(request.destination.as_str())
+                        && !inner.live_volumes.values().any(|v| v.created
+                            && v.request.destination == request.destination
+                            && m.source().as_ref().and_then(|s| s.to_str()) == Some(v.request.source.as_str())
+                            && v.detach.as_ref().is_some_and(|d| d.complete))))
+                || self.spec.linux().as_ref().and_then(|l| l.devices().as_ref())
+                    .is_some_and(|devices| devices.iter()
+                        .any(|d| d.path().to_str() == Some(request.destination.as_str()))) {
+                return Err(anyhow!("volume_update_conflict: destination or volume already owned"));
+            }
+            // Reserve before native insertion: an insertion error can be partial.
+            // A retry must not blindly insert again after ambiguous failure.
+            inner.live_volumes.insert(request.request_id.clone(), PendingVolume {
+                request: request.clone(), metadata_identity, volume: None, device: None, detach: None, created: false,
+            });
+            let mut mount = oci::Mount::default();
+            mount.set_typ(Some("directvol".into()));
+            mount.set_source(Some(request.source.clone().into()));
+            mount.set_destination(request.destination.clone().into());
+            mount.set_options(Some(vec!["rbind".into(),
+                if request.readonly { "ro".into() } else { "rw".into() }]));
+            let mut spec = oci::Spec::default();
+            spec.set_mounts(Some(vec![mount]));
+            let volumes = self.resource_manager.handler_volumes(&self.config.container_id, &spec).await?;
+            // Retain every native result for normal container cleanup even if the
+            // following shape/descriptor checks fail.
+            inner.volumes.extend(volumes.iter().cloned());
+            if volumes.len() != 1 { return Err(anyhow!("volume_update_pending: unexpected native volume result")); }
+            let volume = volumes[0].clone();
+            inner.live_volumes.get_mut(&request.request_id).unwrap().volume = Some(volume.clone());
+            let storage = volume.get_storage()?;
+            if storage.len() != 1 || !matches!(storage[0].driver.as_str(), "blk" | "scsi")
+                || storage[0].source.is_empty() || volume.get_device_id()?.is_none() {
+                return Err(anyhow!("volume_update_pending: unsupported native device descriptor"));
+            }
+            let device = agent::types::Device {
+                id: storage[0].source.clone(), field_type: storage[0].driver.clone(),
+                container_path: request.destination.clone(), ..Default::default()
+            };
+            inner.live_volumes.get_mut(&request.request_id).unwrap().device = Some(device);
+        }
+        let device = inner.live_volumes[&request.request_id].device.clone()
+            .ok_or_else(|| anyhow!("volume_update_pending: native insertion requires reconciliation"))?;
+        // On timeout/error retain the native volume and retry this same agent
+        // operation. Never infer non-use or unmap storage from a failed reply.
+        self.agent.attach_block_device(agent::AttachBlockDeviceRequest {
+            container_id: self.container_id.container_id.clone(),
+            request_id: request.request_id, device,
+        }).await.context("agent attach live volume")?;
+        Ok(())
+    }
+
+    pub async fn detach_live_volume(&self, request: super::live_volume::BlockAttach) -> Result<()> {
+        use super::live_volume::{PendingDetach, validate_generation, validate_detach_target, DETACH_FEATURE};
+        use agent::types::{block_detach_refusal, BlockDetachRefusal};
+        validate_generation(&request, &self.spec)?;
+        let mut inner = self.inner.write().await;
+        if inner.live_growth.contains_key(&request.request_id) || inner.live_growth.values().any(|g|
+            !g.complete && Some(&g.request.attachment.request_id) == request.attach_request_id.as_ref()) {
+            return Err(anyhow!("volume_update_pending: reconcile growth before detach"));
+        }
+        let attach_id = request.attach_request_id.clone().ok_or_else(|| anyhow!("original attach request required"))?;
+        let prior = inner.live_volumes.get(&attach_id).ok_or_else(|| anyhow!("volume_update_conflict: unknown attachment"))?;
+        validate_detach_target(&request, &prior.request)?;
+        if let Some(detach) = &prior.detach {
+            if detach.request != request { return Err(anyhow!("volume_update_conflict: detach request changed")); }
+            if detach.complete { return Ok(()); }
+            if detach.resume_attempted { return Err(anyhow!("volume_update_pending: ambiguous resume requires reconciliation")); }
+        }
+        let details = self.agent.get_guest_details(agent::GetGuestDetailsRequest::default()).await?;
+        if !details.agent_details.as_ref().is_some_and(|a| a.extra_features.iter().any(|f| f == DETACH_FEATURE)) {
+            return Err(anyhow!("volume_update_unsupported: guest detach capability absent"));
+        }
+        let dm = self.resource_manager.get_device_manager().await;
+        if inner.live_volumes[&attach_id].detach.is_none() {
+            use std::os::unix::fs::{FileTypeExt, MetadataExt};
+            let metadata = resource::volume::direct_volumes::volume_mount_info(&request.source)?;
+            super::live_volume::validate_metadata(&request, &metadata)?;
+            if serde_json::to_value(&metadata)? != inner.live_volumes[&attach_id].metadata_identity {
+                return Err(anyhow!("volume_update_conflict: detach metadata changed"));
+            }
+            let host = std::fs::symlink_metadata(&metadata.device)?;
+            if !host.file_type().is_block_device() || metadata.metadata.get("openstack.device_number")
+                != Some(&format!("{}:{}", libc::major(host.rdev()), libc::minor(host.rdev()))) {
+                return Err(anyhow!("volume_update_conflict: detach host device changed"));
+            }
+            inner.check_state(vec![ProcessStatus::Running, ProcessStatus::Paused]).await?;
+            if inner.live_volumes.contains_key(&request.request_id) || inner.live_volumes.values()
+                .any(|v| v.detach.as_ref().is_some_and(|d| d.request.request_id == request.request_id)) {
+                return Err(anyhow!("volume_update_conflict: request ID already used"));
+            }
+            if inner.live_volumes[&attach_id].device.is_none() || inner.live_volumes[&attach_id].volume.is_none() {
+                return Err(anyhow!("volume_update_pending: incomplete native attachment"));
+            }
+            let running = inner.init_process.get_status().await == ProcessStatus::Running;
+            inner.live_volumes.get_mut(&attach_id).unwrap().detach = Some(PendingDetach {
+                request: request.clone(), resume_required: running, pause_attempted: false,
+                paused: !running, prepared: false, prepare_uncertain: false, removal_attempted: false, removed: false,
+                committed: false, resume_attempted: false, complete: false,
+            });
+        }
+        if !inner.live_volumes[&attach_id].detach.as_ref().unwrap().paused {
+            let state = inner.live_volumes.get_mut(&attach_id).unwrap().detach.as_mut().unwrap();
+            if state.pause_attempted { return Err(anyhow!("volume_update_pending: ambiguous pause requires reconciliation")); }
+            state.pause_attempted = true;
+            self.agent.pause_container(self.container_id.clone().into()).await.context("detach pause")?;
+            inner.set_state(ProcessStatus::Paused).await;
+            inner.live_volumes.get_mut(&attach_id).unwrap().detach.as_mut().unwrap().paused = true;
+        }
+        let rpc = |phase: &str| agent::DetachBlockDeviceRequest {
+            container_id: self.container_id.container_id.clone(), request_id: request.request_id.clone(),
+            attach_request_id: attach_id.clone(), phase: phase.into(),
+        };
+        if !inner.live_volumes[&attach_id].detach.as_ref().unwrap().prepared {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let previous_uncertain = inner.live_volumes[&attach_id].detach.as_ref().unwrap().prepare_uncertain;
+                inner.live_volumes.get_mut(&attach_id).unwrap().detach.as_mut().unwrap().prepare_uncertain = true;
+                match self.agent.detach_block_device(rpc("prepare")).await {
+                    Ok(_) => break,
+                    Err(error) => {
+                      let refusal = block_detach_refusal(&error);
+                      if refusal.is_some() && previous_uncertain {
+                          return Err(error.context("earlier prepare is uncertain; no compensation authorized"));
+                      }
+                      if refusal.is_some() {
+                          inner.live_volumes.get_mut(&attach_id).unwrap().detach.as_mut().unwrap().prepare_uncertain = false;
+                      }
+                      match refusal {
+                        Some(BlockDetachRefusal::FreezePending) if tokio::time::Instant::now() < deadline => {
+                            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        }
+                        Some(_) => {
+                            // Only these explicit pre-mutation refusals authorize
+                            // restoration. Unknown failures retain paused state.
+                            if inner.live_volumes[&attach_id].detach.as_ref().unwrap().resume_required {
+                                inner.live_volumes.get_mut(&attach_id).unwrap().detach.as_mut().unwrap().resume_attempted = true;
+                                if let Err(resume) = self.agent.resume_container(self.container_id.clone().into()).await {
+                                    return Err(error.context(format!("detach refused; resume also failed: {resume:#}")));
+                                }
+                                inner.set_state(ProcessStatus::Running).await;
+                            }
+                            inner.live_volumes.get_mut(&attach_id).unwrap().detach = None;
+                            return Err(error.context("detach admission refused without withdrawal"));
+                        }
+                        None => return Err(error.context("detach prepare uncertain; retain paused operation")),
+                      }
+                    }
+                }
+            }
+            inner.live_volumes.get_mut(&attach_id).unwrap().detach.as_mut().unwrap().prepared = true;
+            inner.live_volumes.get_mut(&attach_id).unwrap().detach.as_mut().unwrap().prepare_uncertain = false;
+        }
+        if !inner.live_volumes[&attach_id].detach.as_ref().unwrap().removed {
+            let state = inner.live_volumes.get_mut(&attach_id).unwrap().detach.as_mut().unwrap();
+            if state.removal_attempted { return Err(anyhow!("volume_update_pending: ambiguous native removal requires reconciliation")); }
+            state.removal_attempted = true;
+            let volume = inner.live_volumes[&attach_id].volume.clone().ok_or_else(|| anyhow!("native volume missing"))?;
+            volume.cleanup(&dm).await.context("native live volume removal")?;
+            inner.volumes.retain(|v| !std::sync::Arc::ptr_eq(v, &volume));
+            let prior = inner.live_volumes.get_mut(&attach_id).unwrap();
+            prior.volume = None;
+            prior.detach.as_mut().unwrap().removed = true;
+        }
+        if !inner.live_volumes[&attach_id].detach.as_ref().unwrap().committed {
+            self.agent.detach_block_device(rpc("complete")).await.context("guest detach completion")?;
+            inner.live_volumes.get_mut(&attach_id).unwrap().detach.as_mut().unwrap().committed = true;
+        }
+        if inner.live_volumes[&attach_id].detach.as_ref().unwrap().resume_required {
+            let state = inner.live_volumes.get_mut(&attach_id).unwrap().detach.as_mut().unwrap();
+            if state.resume_attempted { return Err(anyhow!("volume_update_pending: ambiguous resume requires reconciliation")); }
+            state.resume_attempted = true;
+            self.agent.resume_container(self.container_id.clone().into()).await.context("detach resume")?;
+            inner.set_state(ProcessStatus::Running).await;
+        }
+        inner.live_volumes.get_mut(&attach_id).unwrap().detach.as_mut().unwrap().complete = true;
+        Ok(())
+    }
+}
+
+// SPDX-License-Identifier: Apache-2.0
+impl Container {
+    pub async fn grow_live_volume(&self, request: super::live_volume_growth::GrowthRequest) -> Result<()> {
+        use super::live_volume::{validate_generation, validate_metadata};
+        use super::live_volume_growth::{validate_history, PendingGrowth};
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        validate_generation(&request.attachment, &self.spec)?;
+        let mut inner = self.inner.write().await;
+        inner.check_state(vec![ProcessStatus::Running]).await?;
+        let manager = self.resource_manager.get_device_manager().await;
+        if !manager.read().await.supports_block_growth() {
+            return Err(anyhow!("volume_update_unsupported: hypervisor block growth unavailable"));
+        }
+        validate_history(&request, &inner.live_growth)?;
+        if inner.live_volumes.contains_key(&request.request_id) || inner.live_volumes.values()
+            .any(|v| v.detach.as_ref().is_some_and(|d| d.request.request_id == request.request_id)) {
+            return Err(anyhow!("volume_update_conflict: growth ID used by another operation"));
+        }
+        let original = &request.attachment;
+        let prior = inner.live_volumes.get(&original.request_id)
+            .ok_or_else(|| anyhow!("volume_update_conflict: unknown growth attachment"))?;
+        if prior.request != *original || prior.detach.is_some() {
+            return Err(anyhow!("volume_update_conflict: growth attachment changed or is detaching"));
+        }
+        let metadata = resource::volume::direct_volumes::volume_mount_info(&original.source)?;
+        validate_metadata(original, &metadata)?;
+        if serde_json::to_value(&metadata)? != prior.metadata_identity {
+            return Err(anyhow!("volume_update_conflict: growth metadata changed"));
+        }
+        let host = std::fs::symlink_metadata(&metadata.device)?;
+        if !host.file_type().is_block_device() || metadata.metadata.get("openstack.device_number")
+            != Some(&format!("{}:{}", libc::major(host.rdev()), libc::minor(host.rdev()))) {
+            return Err(anyhow!("volume_update_conflict: growth mapping changed"));
+        }
+        let volume = prior.volume.as_ref().context("volume_update_pending: native volume absent")?;
+        let device_id = volume.get_device_id()?.context("volume_update_pending: native device absent")?;
+        let device = prior.device.clone().context("volume_update_pending: guest descriptor absent")?;
+        // Reserve before any guest/runtime call. Lost replies retain the original
+        // attachment and block conflicting growth/detach until this request retries.
+        inner.live_growth.entry(request.request_id.clone()).or_insert_with(|| PendingGrowth {
+            request: request.clone(), complete: false,
+        });
+        // Confirm/replay exposure using the original idempotent attach identity;
+        // PendingVolume alone can represent a lost agent attach reply.
+        self.agent.attach_block_device(agent::AttachBlockDeviceRequest {
+            container_id: self.container_id.container_id.clone(),
+            request_id: original.request_id.clone(), device,
+        }).await.context("confirm original attachment before growth")?;
+        manager.write().await.grow_block_device(&device_id, request.requested_bytes).await?;
+        inner.live_growth.get_mut(&request.request_id).unwrap().complete = true;
+        Ok(())
+    }
+}
+
+// Nova Kata (ADR-044).
+impl Container {
+    pub async fn update_live_network(
+        &self,
+        update: super::live_network::NetworkUpdate,
+    ) -> Result<()> {
+        super::live_network::validate_generation(&update, &self.spec)?;
+        // The container's state is held: no stop and no pause runs while
+        // the guest is given or loses an interface.
+        let inner = self.inner.write().await;
+        inner
+            .check_state(vec![ProcessStatus::Running])
+            .await
+            .context("network_update_conflict: the instance does not run")?;
+        info!(
+            self.logger,
+            "network update {} of {}: {} {:?}",
+            update.request_id,
+            self.container_id.container_id,
+            update.action,
+            update.interface
+        );
+        match update.endpoint() {
+            Some(endpoint) => {
+                self.resource_manager
+                    .update_network(endpoint, update.attaches())
+                    .await
+            }
+            None => self.resource_manager.refresh_network().await,
+        }
     }
 }

@@ -39,3 +39,5 @@ pub mod specconv;
 pub mod sync;
 pub mod sync_with_async;
 pub mod validator;
+
+pub mod live_block_device;

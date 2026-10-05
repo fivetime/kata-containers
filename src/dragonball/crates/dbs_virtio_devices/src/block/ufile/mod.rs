@@ -19,6 +19,13 @@ pub trait Ufile: Read + Write + Seek + Send {
     /// Get disk capacity in bytes.
     fn get_capacity(&self) -> u64;
 
+    /// Read the capacity of the backend again after it has grown, and use
+    /// it from now on (openstack-nova-kata ADR-033). A backend that shrank is
+    /// refused and its capacity kept.
+    fn refresh_capacity(&mut self) -> io::Result<u64> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
     /// Get max size in a segment.
     fn get_max_size(&self) -> u32;
 

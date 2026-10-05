@@ -104,6 +104,8 @@ impl_agent!(
     signal_process | crate::SignalProcessRequest | crate::Empty | None,
     wait_process | crate::WaitProcessRequest | crate::WaitProcessResponse | Some(0),
     update_container | crate::UpdateContainerRequest | crate::Empty | None,
+    attach_block_device | crate::AttachBlockDeviceRequest | crate::Empty | None,
+    detach_block_device | crate::DetachBlockDeviceRequest | crate::Empty | None,
     stats_container | crate::ContainerID | crate::StatsContainerResponse | None,
     pause_container | crate::ContainerID | crate::Empty | None,
     resume_container | crate::ContainerID | crate::Empty | None,

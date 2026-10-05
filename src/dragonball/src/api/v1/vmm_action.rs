@@ -252,10 +252,32 @@ pub enum VmmAction {
     /// Remove a new block device for according to given drive_id
     RemoveBlockDevice(String),
 
+    #[cfg(any(
+        feature = "virtio-net",
+        feature = "vhost-net",
+        feature = "vhost-user-net"
+    ))]
+    /// Nova Kata (ADR-044): ask the guest to release the network device of
+    /// the given iface id.
+    PrepareRemoveNetworkDevice(String),
+
+    #[cfg(any(
+        feature = "virtio-net",
+        feature = "vhost-net",
+        feature = "vhost-user-net"
+    ))]
+    /// Nova Kata (ADR-044): remove the network device of the given iface id.
+    RemoveNetworkDevice(String),
+
     #[cfg(any(feature = "virtio-blk", feature = "vhost-user-blk"))]
     /// Update a block device, after microVM start. Currently, the only updatable properties
     /// are the RX and TX rate limiters.
     UpdateBlockDevice(BlockDeviceConfigUpdateInfo),
+
+    #[cfg(any(feature = "virtio-blk", feature = "vhost-user-blk"))]
+    /// Show the guest the new capacity, in bytes, of a block device whose
+    /// host device has grown (openstack-nova-kata ADR-033).
+    ResizeBlockDevice(String, u64),
 
     #[cfg(any(
         feature = "virtio-net",
@@ -424,8 +446,28 @@ impl VmmService {
                 self.update_blk_rate_limiters(vmm, blk_update)
             }
             #[cfg(any(feature = "virtio-blk", feature = "vhost-user-blk"))]
+            VmmAction::ResizeBlockDevice(drive_id, requested) => {
+                self.resize_block_device(vmm, &drive_id, requested)
+            }
+            #[cfg(any(feature = "virtio-blk", feature = "vhost-user-blk"))]
             VmmAction::RemoveBlockDevice(drive_id) => {
                 self.remove_block_device(vmm, event_mgr, &drive_id)
+            }
+            #[cfg(any(
+                feature = "virtio-net",
+                feature = "vhost-net",
+                feature = "vhost-user-net"
+            ))]
+            VmmAction::PrepareRemoveNetworkDevice(iface_id) => {
+                self.prepare_remove_network_device(vmm, &iface_id)
+            }
+            #[cfg(any(
+                feature = "virtio-net",
+                feature = "vhost-net",
+                feature = "vhost-user-net"
+            ))]
+            VmmAction::RemoveNetworkDevice(iface_id) => {
+                self.remove_network_device(vmm, event_mgr, &iface_id)
             }
             #[cfg(any(
                 feature = "virtio-net",
@@ -809,6 +851,21 @@ impl VmmService {
     #[cfg(any(feature = "virtio-blk", feature = "vhost-user-blk"))]
     /// Updates configuration for an emulated net device as described in `config`.
     #[instrument(skip(self))]
+    #[cfg(any(feature = "virtio-blk", feature = "vhost-user-blk"))]
+    fn resize_block_device(
+        &mut self,
+        vmm: &mut Vmm,
+        drive_id: &str,
+        requested: u64,
+    ) -> VmmRequestResult {
+        let vm = vmm.get_vm_mut().ok_or(VmmActionError::InvalidVMID)?;
+        vm.device_manager_mut()
+            .block_manager
+            .resize_device(drive_id, requested)
+            .map(|_| VmmData::Empty)
+            .map_err(VmmActionError::Block)
+    }
+
     fn update_blk_rate_limiters(
         &mut self,
         vmm: &mut Vmm,
@@ -904,6 +961,57 @@ impl VmmService {
         vm.device_manager_mut()
             .net_manager
             .insert_device(ctx, config)
+            .map(|_| VmmData::Empty)
+            .map_err(VmmActionError::Network)
+    }
+
+    // Nova Kata (ADR-044): as prepare_remove_block_device.
+    #[cfg(any(
+        feature = "virtio-net",
+        feature = "vhost-net",
+        feature = "vhost-user-net"
+    ))]
+    fn prepare_remove_network_device(&mut self, vmm: &mut Vmm, iface_id: &str) -> VmmRequestResult {
+        let vm = vmm.get_vm_mut().ok_or(VmmActionError::InvalidVMID)?;
+        let ctx = vm.create_device_op_context(None).map_err(|e| {
+            if let StartMicroVmError::MicroVMAlreadyRunning = e {
+                VmmActionError::Network(NetworkDeviceError::UpdateNotAllowedPostBoot)
+            } else if let StartMicroVmError::UpcallServerNotReady = e {
+                VmmActionError::UpcallServerNotReady
+            } else {
+                VmmActionError::StartMicroVm(e)
+            }
+        })?;
+
+        let (sender, receiver) = mpsc::channel();
+
+        vm.device_manager_mut()
+            .net_manager
+            .prepare_remove_device(&ctx, iface_id, sender.clone())
+            .map(|_| VmmData::SyncHotplug((sender, receiver)))
+            .map_err(VmmActionError::Network)
+    }
+
+    // Nova Kata (ADR-044): as remove_block_device.
+    #[cfg(any(
+        feature = "virtio-net",
+        feature = "vhost-net",
+        feature = "vhost-user-net"
+    ))]
+    fn remove_network_device(
+        &mut self,
+        vmm: &mut Vmm,
+        event_mgr: &mut EventManager,
+        iface_id: &str,
+    ) -> VmmRequestResult {
+        let vm = vmm.get_vm_mut().ok_or(VmmActionError::InvalidVMID)?;
+        let ctx = vm
+            .create_device_op_context(Some(event_mgr.epoll_manager()))
+            .map_err(|_| VmmActionError::Network(NetworkDeviceError::UpdateNotAllowedPostBoot))?;
+
+        vm.device_manager_mut()
+            .net_manager
+            .remove_device(ctx, iface_id)
             .map(|_| VmmData::Empty)
             .map_err(VmmActionError::Network)
     }

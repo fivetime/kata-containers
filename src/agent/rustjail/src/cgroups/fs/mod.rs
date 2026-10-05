@@ -43,6 +43,8 @@ use std::sync::{Arc, RwLock};
 
 use super::DevicesCgroupInfo;
 
+mod nova_cgroup;
+
 const GUEST_CPUS_PATH: &str = "/sys/devices/system/cpu/online";
 const ROOT_SUBCGROUP: &str = "/";
 const INIT_SUBCGROUP: &str = "/init/";
@@ -72,6 +74,8 @@ pub struct Manager {
     pod_cgroup: Option<cgroups::Cgroup>,
     #[serde(skip)]
     devcg_allowed_all: bool,
+    #[serde(skip)]
+    nova_cgroup: Option<Arc<nova_cgroup::RetainedCgroup>>,
 }
 
 // set_resource is used to set reources by cgroup controller.
@@ -86,6 +90,9 @@ macro_rules! set_resource {
 
 impl CgroupManager for Manager {
     fn apply(&self, pid: pid_t) -> Result<()> {
+        if let Some(group) = self.nova_group()? {
+            return group.attach(pid).context("attach original Nova cgroup");
+        }
         let cgroup_pid = CgroupPid::from(pid as u64);
         if cgroup_has_init_subcgroup(&self.cpath) {
             let cpath = self.cgroup_path_with_subcgroup(INIT_SUBCGROUP);
@@ -194,6 +201,15 @@ impl CgroupManager for Manager {
         })
     }
 
+    fn owned_frozen(&self) -> Result<bool> {
+        let group = self
+            .nova_group()?
+            .ok_or_else(|| anyhow!("original Nova cgroup owner unavailable"))?;
+        group
+            .is_frozen()
+            .context("observe original Nova cgroup frozen event")
+    }
+
     fn freeze(&self, state: FreezerState) -> Result<()> {
         let freezer_controller: &FreezerController = self.cgroup.controller_of().unwrap();
         match state {
@@ -211,7 +227,25 @@ impl CgroupManager for Manager {
         Ok(())
     }
 
+    fn owned_empty(&self) -> Result<bool> {
+        let group = self
+            .nova_group()?
+            .ok_or_else(|| anyhow!("original Nova cgroup owner unavailable"))?;
+        group.is_empty().context("observe original Nova cgroup")
+    }
+
+    fn kill_all(&self) -> Result<bool> {
+        if let Some(group) = self.nova_group()? {
+            group.kill_all().context("kill original Nova cgroup")?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     fn destroy(&self) -> Result<()> {
+        if let Some(group) = self.nova_group()? {
+            return group.destroy().context("destroy original Nova cgroup");
+        }
         if let Err(err) = self.cgroup.delete() {
             warn!(
                 sl(),
@@ -1077,6 +1111,17 @@ fn load_cgroup(h: Box<dyn cgroups::Hierarchy>, path: &str) -> Cgroup {
 }
 
 impl Manager {
+    fn nova_group(&self) -> Result<Option<&nova_cgroup::RetainedCgroup>> {
+        if nova_cgroup::in_scope(&self.cpath) {
+            return self
+                .nova_cgroup
+                .as_deref()
+                .map(Some)
+                .ok_or_else(|| anyhow!("original Nova cgroup owner unavailable"));
+        }
+        Ok(None)
+    }
+
     pub fn new(
         cpath: &str,
         spec: &Spec,
@@ -1148,6 +1193,16 @@ impl Manager {
             pod_cgroup = None;
         }
 
+        // Reserve the Nova instance node exclusively before the general library
+        // can adopt an existing path. Handles are never reconstructed from JSON.
+        let nova_cgroup = if nova_cgroup::in_scope(cpath) {
+            Some(Arc::new(
+                nova_cgroup::RetainedCgroup::create(&cgroups::hierarchies::auto().root(), cpath)
+                    .context("create original Nova cgroup owner")?,
+            ))
+        } else {
+            None
+        };
         // Create a cgroup for the container.
         let cg = new_cgroup(cgroups::hierarchies::auto(), cpath)?;
         // The rules of container cgroup are copied from its parent, which
@@ -1167,6 +1222,7 @@ impl Manager {
             cpath: cpath.to_string(),
             cgroup: cg,
             pod_cgroup,
+            nova_cgroup,
             devcg_allowed_all: devices_group_info
                 .map(|info| info.allowed_all)
                 .unwrap_or(false),
@@ -1188,6 +1244,7 @@ impl Manager {
             pod_cgroup: None,
             cgroup: cg,
             devcg_allowed_all: false,
+            nova_cgroup: None,
         })
     }
 
@@ -1455,6 +1512,7 @@ mod tests {
             cgroup: load_cgroup(cgroups::hierarchies::auto(), "/"),
             pod_cgroup: None,
             devcg_allowed_all: false,
+            nova_cgroup: None,
         };
 
         assert_eq!(

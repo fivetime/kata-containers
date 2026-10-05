@@ -119,7 +119,23 @@ fn new_listener(address: &Path) -> Result<UnixListener> {
         fs::create_dir_all(parent_dir).context("create parent dir")?;
     }
 
-    UnixListener::bind(file_path).context("bind address")
+    match UnixListener::bind(file_path) {
+        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
+            // A shim that died without its cleanup (killed, or exited after a
+            // failed start) leaves this socket behind, and every later start
+            // of the sandbox then fails here. containerd's Go shims remove it
+            // and bind again; remove it only when nothing listens on it.
+            match std::os::unix::net::UnixStream::connect(file_path) {
+                Err(probe) if probe.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    fs::remove_file(file_path).context("remove stale socket")?;
+                    UnixListener::bind(file_path).context("bind address")
+                }
+                Ok(_) => Err(err).context("bind address: a shim still listens"),
+                Err(_) => Err(err).context("bind address"),
+            }
+        }
+        result => result.context("bind address"),
+    }
 }
 
 #[cfg(test)]
@@ -168,6 +184,22 @@ mod tests {
         std::fs::remove_file(path).ok();
 
         let _ = new_listener(Path::new(&uds_path)).unwrap();
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    #[serial]
+    fn test_new_listener_replaces_only_a_dead_socket() {
+        let path = "/tmp/nova-kata-stale-shim.sock";
+        let uds_path = format!("unix://{}", path);
+        std::fs::remove_file(path).ok();
+        // A listener dropped without unlinking is what a killed shim leaves.
+        drop(std::os::unix::net::UnixListener::bind(path).unwrap());
+        assert!(Path::new(path).exists());
+        let live = new_listener(Path::new(&uds_path)).unwrap();
+        // A socket something still listens on is never taken over.
+        assert!(new_listener(Path::new(&uds_path)).is_err());
+        drop(live);
         std::fs::remove_file(path).ok();
     }
 }

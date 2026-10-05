@@ -7,6 +7,8 @@
 
 mod nydus;
 
+pub mod nova_shares;
+
 mod share_virtio_fs;
 pub use share_virtio_fs::rafs_mount;
 mod share_virtio_fs_inline;

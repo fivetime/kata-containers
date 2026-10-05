@@ -44,10 +44,23 @@ use crate::{
     network::{self, dan_config_path, Network, NetworkConfig, NetworkWithNetNsConfig},
     resource_persist::ResourceState,
     rootfs::{RootFsResource, Rootfs},
-    share_fs::{self, sandbox_bind_mounts::SandboxBindMounts, NydusShareFs, ShareFs},
+    share_fs::{
+        self, nova_shares::NovaShareDaemons, sandbox_bind_mounts::SandboxBindMounts, NydusShareFs,
+        ShareFs,
+    },
     volume::{utils::is_block_device_readonly, Volume, VolumeResource},
     ResourceConfig, ResourceUpdateOp,
 };
+
+// Nova Kata (ADR-044).
+#[derive(Clone, Copy, Debug)]
+enum NetworkStep {
+    Attach,
+    Refresh,
+    Confirm,
+    Detach,
+    Discard,
+}
 
 pub(crate) struct ResourceManagerInner {
     sid: String,
@@ -58,6 +71,7 @@ pub(crate) struct ResourceManagerInner {
     network: Option<Arc<dyn Network>>,
     share_fs: Option<Arc<dyn ShareFs>>,
     nydus_share_fs: Option<Arc<dyn NydusShareFs>>,
+    nova_shares: NovaShareDaemons,
 
     pub rootfs_resource: RootFsResource,
     pub volume_resource: VolumeResource,
@@ -130,6 +144,7 @@ impl ResourceManagerInner {
             network: None,
             share_fs: None,
             nydus_share_fs: None,
+            nova_shares: NovaShareDaemons::default(),
             rootfs_resource: RootFsResource::new(),
             volume_resource: VolumeResource::new(),
             cgroups_resource,
@@ -178,6 +193,16 @@ impl ResourceManagerInner {
                         self.share_fs = Some(instance.share_fs);
                         self.nydus_share_fs = instance.nydus_share_fs;
                     };
+                }
+                ResourceConfig::NovaShares(shares) => {
+                    self.nova_shares
+                        .setup(
+                            &self.toml_config.runtime.hypervisor_name,
+                            self.hypervisor.as_ref(),
+                            &self.device_manager,
+                            &shares,
+                        )
+                        .await?;
                 }
                 ResourceConfig::Network(c) => {
                     self.handle_network(c)
@@ -262,6 +287,130 @@ impl ResourceManagerInner {
         .context("failed to set up network")?;
         self.network = Some(network);
         Ok(())
+    }
+
+    // Nova Kata (ADR-044). The steps in the namespace run on a thread of
+    // their own, as handle_network's do and for its reasons.
+    fn network_step(
+        network: Arc<dyn Network>,
+        update: network::EndpointUpdate,
+        step: NetworkStep,
+    ) -> Result<Option<network::AttachedEndpoint>> {
+        thread::spawn(move || -> Result<Option<network::AttachedEndpoint>> {
+            let rt = runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(async {
+                match step {
+                    NetworkStep::Attach => network.attach_endpoint(&update).await.map(Some),
+                    NetworkStep::Refresh => network.refresh().await.map(|_| None),
+                    NetworkStep::Confirm => network.confirm_endpoint(&update).await.map(|_| None),
+                    NetworkStep::Detach => {
+                        network.detach_endpoint(&update, true).await.map(|_| None)
+                    }
+                    NetworkStep::Discard => {
+                        network.detach_endpoint(&update, false).await.map(|_| None)
+                    }
+                }
+            })
+        })
+        .join()
+        .map_err(|e| anyhow!("{:?}", e))
+        .context("Couldn't join on the associated thread")?
+    }
+
+    pub async fn update_network(
+        &self,
+        update: network::EndpointUpdate,
+        attach: bool,
+    ) -> Result<()> {
+        let network = self
+            .network
+            .clone()
+            .ok_or_else(|| anyhow!("network_update_unsupported: the sandbox has no network"))?;
+        if !attach {
+            Self::network_step(network, update, NetworkStep::Detach)
+                .context("network_update_failed: detach")?;
+            return Ok(());
+        }
+        let attached = Self::network_step(network.clone(), update.clone(), NetworkStep::Attach)
+            .context("network_update_failed: attach")?
+            .ok_or_else(|| anyhow!("network_update_failed: nothing was attached"))?;
+        info!(
+            sl!(),
+            "attached {} as {:?}", attached.host_interface, attached.interface
+        );
+        let told = async {
+            self.update_interface(attached.interface.clone()).await?;
+            Self::network_step(network.clone(), update.clone(), NetworkStep::Refresh)?;
+            self.handle_neighbours(network.as_ref())
+                .await
+                .context("handle neighbors")?;
+            self.handle_routes(network.as_ref())
+                .await
+                .context("handle routes")?;
+            Self::network_step(network.clone(), update.clone(), NetworkStep::Confirm)
+                .map(|_| ())
+        }
+        .await;
+        if let Err(e) = told {
+            // The guest is not given half an interface.
+            if let Err(undo) =
+                Self::network_step(network.clone(), update.clone(), NetworkStep::Discard)
+            {
+                warn!(sl!(), "failed to take back the interface: {:?}", undo);
+            }
+            return Err(e).context("network_update_failed: the guest was not told");
+        }
+        Ok(())
+    }
+
+    pub async fn refresh_network(&self) -> Result<()> {
+        let network = self
+            .network
+            .clone()
+            .ok_or_else(|| anyhow!("network_update_unsupported: the sandbox has no network"))?;
+        let nothing = network::EndpointUpdate {
+            port_id: String::new(),
+            interface: String::new(),
+            mac: String::new(),
+            mtu: 0,
+        };
+        Self::network_step(network.clone(), nothing, NetworkStep::Refresh)
+            .context("network_update_failed: refresh")?;
+        self.handle_neighbours(network.as_ref())
+            .await
+            .context("network_update_failed: neighbors")?;
+        self.handle_routes(network.as_ref())
+            .await
+            .context("network_update_failed: routes")
+    }
+
+    async fn update_interface(&self, i: agent::Interface) -> Result<()> {
+        // As handle_interfaces: the guest needs time to find the device.
+        let mut last_error = None;
+        for attempt in 0..50u32 {
+            match self
+                .agent
+                .update_interface(agent::UpdateInterfaceRequest {
+                    interface: Some(i.clone()),
+                })
+                .await
+            {
+                core::result::Result::Ok(_) => return Ok(()),
+                core::result::Result::Err(e) => {
+                    debug!(
+                        sl!(),
+                        "update_interface attempt {} failed, retrying: {:?}",
+                        attempt + 1,
+                        e
+                    );
+                    last_error = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+        Err(last_error.unwrap()).context("update interface")
     }
 
     async fn handle_interfaces(&self, network: &dyn Network) -> Result<()> {
@@ -964,16 +1113,17 @@ impl ResourceManagerInner {
             }
         }
 
-        // clean up cgroup
-        self.cgroups_resource
-            .delete()
-            .await
-            .context("delete cgroup")?;
-
         // cleanup sandbox bind mounts: setup = false
         self.handle_sandbox_bindmounts(false)
             .await
             .context("failed to cleanup sandbox bindmounts")?;
+
+        // Nova share daemons (ADR-045) end like the sandbox daemon once the
+        // VMM has closed their sockets; a failure of one never skips the other.
+        let shares_stopped = self.nova_shares.stop(true).await;
+        if let Err(error) = &shares_stopped {
+            warn!(sl!(), "failed to stop share virtiofsd: {:#}", error);
+        }
 
         // stop share fs daemon (e.g., virtiofsd, nydusd) before cleaning up mount
         if let Some(share_fs) = &self.share_fs {
@@ -982,6 +1132,7 @@ impl ResourceManagerInner {
                 .await
                 .context("failed to stop share fs daemon")?;
         }
+        shares_stopped.context("failed to stop share virtiofsd")?;
 
         // clean up share fs mount
         if let Some(share_fs) = &self.share_fs {
@@ -1000,6 +1151,13 @@ impl ResourceManagerInner {
             .cleanup_ephemeral_disks()
             .await
             .context("failed to cleanup ephemeral disks")?;
+
+        // VMM and share-fs helpers must be gone before moving this shim and
+        // destroying its group. Any remaining process keeps deletion failed.
+        self.cgroups_resource
+            .delete()
+            .await
+            .context("delete cgroup")?;
 
         Ok(())
     }
@@ -1138,6 +1296,7 @@ impl Persist for ResourceManagerInner {
             network: None,
             share_fs: None,
             nydus_share_fs: None,
+            nova_shares: NovaShareDaemons::default(),
             rootfs_resource: RootFsResource::new(),
             volume_resource: VolumeResource::new(),
             cgroups_resource: CgroupsResource::restore(

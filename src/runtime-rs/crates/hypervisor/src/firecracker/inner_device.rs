@@ -29,6 +29,8 @@ impl FcInner {
         match device {
             DeviceType::BlockModern(block_mod) => {
                 let block = block_mod.lock().await.clone();
+                // Firecracker is given no limits of a device (ADR-051).
+                crate::refuse_volume_qos(block.config.io_limits.as_ref(), "firecracker")?;
                 self.hotplug_block_device(block.config.path_on_host.as_str(), block.config.index)
                     .await
                     .context("add block device")

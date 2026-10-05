@@ -550,6 +550,10 @@ where
     }
 
     fn remove(&mut self) {
+        // Nova Kata (ADR-044): the kernel's vhost worker holds the TAP of a
+        // queue pair until its handle is closed. A device that leaves a VM
+        // that goes on running gives the TAP back with it.
+        self.handles.clear();
         self.taps.clear();
 
         let subscriber_id = self.subscriber_id.take();

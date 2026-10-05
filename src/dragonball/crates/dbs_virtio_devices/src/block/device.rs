@@ -12,8 +12,10 @@ use std::io::{Seek, SeekFrom};
 use std::marker::PhantomData;
 use std::sync::{mpsc, Arc};
 use std::thread;
+use std::time::Duration;
 
 use dbs_device::resources::ResourceConstraint;
+use dbs_interrupt::InterruptNotifier;
 use dbs_utils::{
     epoll_manager::{EpollManager, SubscriberId},
     rate_limiter::{BucketUpdate, RateLimiter},
@@ -70,8 +72,13 @@ pub struct Block<AS: DbsGuestAddressSpace> {
     kill_evts: Vec<EventFd>,
     evt_senders: Vec<mpsc::Sender<KillEvent>>,
     epoll_threads: Vec<thread::JoinHandle<()>>,
+    /// Tells the guest that the configuration changed, once activated.
+    device_change_notifier: Option<Arc<dyn InterruptNotifier>>,
     phantom: PhantomData<AS>,
 }
+
+/// How long a queue of the device is given to take a new capacity.
+const RESIZE_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl<AS: DbsGuestAddressSpace> Block<AS> {
     /// Create a new virtio block device that operates on the given file.
@@ -144,7 +151,87 @@ impl<AS: DbsGuestAddressSpace> Block<AS> {
             evt_senders: Vec::with_capacity(num_queues),
             kill_evts: Vec::with_capacity(num_queues),
             epoll_threads: Vec::with_capacity(num_queues),
+            device_change_notifier: None,
         })
+    }
+
+    /// The capacity the guest is shown, in bytes.
+    pub fn capacity(&self) -> u64 {
+        let mut sectors = [0u8; 8];
+        sectors.copy_from_slice(&self.device_info.config_space[..8]);
+        u64::from_le_bytes(sectors) << SECTOR_SHIFT
+    }
+
+    /// Show the guest a backend that has grown (openstack-nova-kata ADR-033).
+    ///
+    /// The host device was grown by its owner; the requested size must be
+    /// its size, sector aligned and no smaller than the device's. Every
+    /// queue takes the capacity first, then the configuration space has it
+    /// and the guest is told with a configuration change interrupt. An equal
+    /// size changes nothing; a smaller one is refused.
+    pub fn resize(&mut self, requested: u64) -> Result<u64> {
+        let current = self.capacity();
+        if requested == 0 || requested % SECTOR_SIZE != 0 {
+            return Err(Error::InvalidInput);
+        }
+        if requested < current {
+            return Err(Error::IOError(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "virtio-blk: shrinking from {} to {} is refused",
+                    current, requested
+                ),
+            )));
+        }
+        if requested == current {
+            return Ok(current);
+        }
+        let refused = |reason: String| {
+            Error::IOError(std::io::Error::other(format!(
+                "virtio-blk: the capacity {} was not taken: {}",
+                requested, reason
+            )))
+        };
+        if self.evt_senders.is_empty() {
+            // Not activated: the images are still the device's own.
+            for image in self.disk_images.iter_mut() {
+                let capacity = image
+                    .refresh_capacity()
+                    .map_err(|e| refused(e.to_string()))?;
+                if capacity != requested {
+                    return Err(refused(format!("backend capacity is {}", capacity)));
+                }
+            }
+        } else {
+            if self.evt_senders.len() != self.kill_evts.len() {
+                return Err(Error::InternalError);
+            }
+            let mut replies = Vec::with_capacity(self.evt_senders.len());
+            for sender in self.evt_senders.iter() {
+                let (reply, answer) = mpsc::channel();
+                sender
+                    .send(KillEvent::Resize(requested, reply))
+                    .map_err(|_| refused("a queue is gone".to_string()))?;
+                replies.push(answer);
+            }
+            for kill_evt in self.kill_evts.iter() {
+                kill_evt.write(1).map_err(|e| refused(e.to_string()))?;
+            }
+            for answer in replies {
+                match answer.recv_timeout(RESIZE_REPLY_TIMEOUT) {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(reason)) => return Err(refused(reason)),
+                    Err(e) => return Err(refused(format!("a queue did not answer: {}", e))),
+                }
+            }
+        }
+        let sectors = (requested >> SECTOR_SHIFT).to_le_bytes();
+        self.device_info.config_space[..8].copy_from_slice(&sectors);
+        if let Some(notifier) = self.device_change_notifier.as_ref() {
+            notifier.notify().map_err(Error::IOError)?;
+        }
+        info!("virtio-blk: capacity grown from {} to {}", current, requested);
+        Ok(requested)
     }
 
     fn build_config_space(disk_size: u64, max_size: u32, num_queues: u16, sparse: bool) -> Vec<u8> {
@@ -284,6 +371,7 @@ where
             return Err(ActivateError::InternalError);
         }
         let mut kill_evts = Vec::with_capacity(self.queue_sizes.len());
+        self.device_change_notifier = Some(config.device_change_notifier.clone());
 
         let mut i = 0;
         // first to reverse the queue's order, thus to make sure the following
@@ -993,6 +1081,50 @@ mod tests {
         )
         .unwrap();
         assert!(req.check_capacity(&mut disk, &data_descs).is_ok());
+    }
+
+    #[test]
+    fn nova_block_growth_resize_before_activation() {
+        use crate::block::aio::Aio;
+        use std::os::unix::io::AsRawFd;
+        use vmm_sys_util::tempfile::TempFile;
+
+        let engine_file = TempFile::new().unwrap();
+        let engine = Aio::new(engine_file.as_file().as_raw_fd(), 128).unwrap();
+        let file = TempFile::new().unwrap().into_file();
+        file.set_len(4096).unwrap();
+        let handle = file.try_clone().unwrap();
+        let disk: Box<dyn Ufile> = Box::new(LocalFile::new(file, false, engine).unwrap());
+        let mut dev = Block::<Arc<GuestMemoryMmap>>::new(
+            vec![disk],
+            false,
+            false,
+            Arc::new(vec![128]),
+            EpollManager::default(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        assert_eq!(dev.capacity(), 4096);
+        // Equal: nothing changes. Unaligned, zero or smaller: refused.
+        assert_eq!(dev.resize(4096).unwrap(), 4096);
+        assert!(dev.resize(4097).is_err());
+        assert!(dev.resize(0).is_err());
+        assert!(dev.resize(2048).is_err());
+        // A size the backend does not have is refused, and not shown.
+        assert!(dev.resize(8192).is_err());
+        assert_eq!(dev.capacity(), 4096);
+        handle.set_len(8192).unwrap();
+        assert_eq!(dev.resize(8192).unwrap(), 8192);
+        assert_eq!(dev.capacity(), 8192);
+        let mut sectors = [0u8; 8];
+        VirtioDevice::<Arc<GuestMemoryMmap<()>>, QueueSync, GuestRegionMmap>::read_config(
+            &mut dev,
+            0,
+            &mut sectors,
+        )
+        .unwrap();
+        assert_eq!(u64::from_le_bytes(sectors), 16);
     }
 
     #[test]

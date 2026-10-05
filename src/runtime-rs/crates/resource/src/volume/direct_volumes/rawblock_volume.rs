@@ -11,7 +11,7 @@ use hypervisor::{
         device_manager::{do_handle_device, get_block_device_info, DeviceManager},
         DeviceConfig,
     },
-    BlockConfigModern, BlockDeviceAio,
+    BlockConfigModern, BlockDeviceAio, BlockIoLimits,
 };
 use kata_types::mount::DirectVolumeMountInfo;
 use nix::sys::{stat, stat::SFlag};
@@ -50,6 +50,10 @@ impl RawblockVolume {
             ));
         }
 
+        // Front-end QoS of the volume (openstack-nova-kata ADR-051): refused
+        // before the device is looked at when a key or value is not understood.
+        let io_limits = BlockIoLimits::from_volume_metadata(&mount_info.metadata)?;
+
         let fstat = stat::stat(mount_info.device.as_str())
             .with_context(|| format!("stat volume device file: {}", mount_info.device.clone()))?;
         if SFlag::from_bits_truncate(fstat.st_mode) != SFlag::S_IFREG
@@ -80,6 +84,8 @@ impl RawblockVolume {
 
         let block_config = BlockConfigModern {
             path_on_host: mount_info.device.clone(),
+            major: stat::major(fstat.st_rdev) as i64,
+            minor: stat::minor(fstat.st_rdev) as i64,
             is_readonly: read_only,
             driver_option: blkdev_info.block_device_driver,
             blkdev_aio: BlockDeviceAio::new(&blkdev_info.block_device_aio),
@@ -87,6 +93,7 @@ impl RawblockVolume {
             queue_size: blkdev_info.queue_size,
             logical_sector_size: blkdev_info.block_device_logical_sector_size,
             physical_sector_size: blkdev_info.block_device_physical_sector_size,
+            io_limits,
             ..Default::default()
         };
 

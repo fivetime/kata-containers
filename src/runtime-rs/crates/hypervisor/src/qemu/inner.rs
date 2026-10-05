@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use super::cmdline_generator::{get_network_device, QemuCmdLine};
+use super::cmdline_generator::{boot_network_slot, get_network_device, QemuCmdLine};
 use super::qmp::Qmp;
 use crate::device::pci_path::PciPath;
 use crate::device::topology::PCIePort;
@@ -141,6 +141,13 @@ impl QemuInner {
                 }
                 DeviceType::BlockModern(ref block_device) => {
                     info!(sl!(), "Starting QMP hotplug for BlockModern device");
+                    // Limits of a device (ADR-051) are given through QMP to a
+                    // device of the running VM only.
+                    if block_device.lock().await.config.io_limits.is_some() {
+                        return Err(anyhow!(
+                            "volume_qos_unsupported: qemu keeps limits only of a device added to a running VM"
+                        ));
+                    }
 
                     // First, snapshot parameters within the lock.
                     // Do not hold the lock across the 'await' point of the hotplug operation to avoid blocking.
@@ -509,6 +516,22 @@ impl QemuInner {
                 let bridge_count = self.config.device_info.default_bridges;
                 if bridge_count > 0 {
                     qmp.init_pci_bridges(bridge_count);
+                }
+                // Nova Kata (ADR-044): the network devices of the command
+                // line hold slots of the bridge; a hot-plug must find them
+                // taken.
+                let mut index = 0;
+                for device in &self.devices {
+                    if let DeviceType::Network(network) = device {
+                        if let Some((bridge, slot)) = boot_network_slot(&self.config, index) {
+                            qmp.record_network_device(
+                                &bridge,
+                                slot,
+                                &network.config.host_dev_name,
+                            );
+                        }
+                        index += 1;
+                    }
                 }
                 self.qmp = Some(qmp);
             }
@@ -1256,6 +1279,7 @@ impl QemuInner {
                     driver,
                     logical_sector_size,
                     physical_sector_size,
+                    io_limits,
                 ) = {
                     let cfg = &block_device.lock().await.config;
                     (
@@ -1273,6 +1297,7 @@ impl QemuInner {
                         self.config.blockdev_info.block_device_driver.clone(),
                         cfg.logical_sector_size,
                         cfg.physical_sector_size,
+                        cfg.io_limits,
                     )
                 };
 
@@ -1307,6 +1332,7 @@ impl QemuInner {
                         physical_sector_size,
                         vmdk.as_ref(),
                         iothread,
+                        io_limits.as_ref(),
                     )
                     .context("hotplug block device")?;
 
@@ -1542,5 +1568,104 @@ mod tests {
             }
             None => assert!(warnings.is_empty()),
         }
+    }
+}
+
+// SPDX-License-Identifier: Apache-2.0
+// Included in qemu::inner on the pinned runtime-rs source.
+
+fn validate_growth_device(device: &crate::BlockDeviceModern) -> Result<()> {
+    // A structured VMDK layout means a composed, non-raw source (Kata 4.2.0).
+    if device.device_id.is_empty() || device.attach_count != 1
+        || device.config.is_readonly || device.config.vmdk.is_some()
+        || device.config.major < 0 || device.config.minor < 0 {
+        return Err(anyhow!("block growth requires one attached writable raw device with known identity"));
+    }
+    Ok(())
+}
+
+nix::ioctl_read!(growth_block_size, 0x12, 114, u64);
+
+impl QemuInner {
+    // Nova Kata (ADR-044). The device is one hotplug_device added, or one of
+    // the command line, which carries the same names.
+    pub(crate) async fn remove_network_device(
+        &mut self,
+        device: crate::NetworkDevice,
+    ) -> Result<()> {
+        info!(
+            sl!(),
+            "QemuInner::remove_network_device() {}", device.config.host_dev_name
+        );
+        self.qmp
+            .as_mut()
+            .context("network removal requires connected QMP")?
+            .hotunplug_network_device(&device.config.host_dev_name)?;
+        self.devices.retain(|d| {
+            !matches!(d, DeviceType::Network(n)
+                if n.config.host_dev_name == device.config.host_dev_name)
+        });
+        Ok(())
+    }
+
+    pub(crate) async fn grow_block_device(&mut self, device: DeviceType, requested: u64) -> Result<()> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+        let DeviceType::BlockModern(shared) = device else {
+            return Err(anyhow!("block growth unsupported for this device type"));
+        };
+        let device = shared.lock().await;
+        validate_growth_device(&device)?;
+        // Keep the native block handle locked and the verified descriptor alive
+        // through the QMP operation. Never remap or resize the storage backend.
+        let source = &device.config.path_on_host;
+        let file = std::fs::OpenOptions::new().read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(source)?;
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_block_device()
+            || libc::major(metadata.rdev()) as i64 != device.config.major
+            || libc::minor(metadata.rdev()) as i64 != device.config.minor {
+            return Err(anyhow!("block growth host device identity changed"));
+        }
+        let mut host_bytes = 0_u64;
+        unsafe { growth_block_size(file.as_raw_fd(), &mut host_bytes) }
+            .context("read owned host block capacity")?;
+        let qemu_pid = self.get_vmm_master_tid().await?;
+        self.qmp.as_mut().context("block growth requires connected QMP")?
+            .grow_block_device(device.config.index, qemu_pid, device.config.major,
+                               device.config.minor, host_bytes, requested)
+    }
+}
+
+#[cfg(test)]
+mod nova_block_growth_device_tests {
+    use super::*;
+
+    fn attached() -> crate::BlockDeviceModern {
+        crate::BlockDeviceModern { device_id: "owned".into(), attach_count: 1,
+            config: crate::BlockConfigModern { major: 252, minor: 1, ..Default::default() } }
+    }
+
+    #[test]
+    fn only_exclusive_attached_raw_writable_device_is_admitted() {
+        assert!(validate_growth_device(&attached()).is_ok());
+        for count in [0, 2, u64::MAX] {
+            let mut device = attached(); device.attach_count = count;
+            assert!(validate_growth_device(&device).is_err());
+        }
+        let mut device = attached(); device.config.is_readonly = true;
+        assert!(validate_growth_device(&device).is_err());
+        let mut device = attached(); device.config.vmdk = Some(crate::VmdkConfig::default());
+        assert!(validate_growth_device(&device).is_err());
+    }
+
+    #[test]
+    fn missing_device_identity_is_refused() {
+        let mut device = attached(); device.device_id.clear();
+        assert!(validate_growth_device(&device).is_err());
+        let mut device = attached(); device.config.major = -1;
+        assert!(validate_growth_device(&device).is_err());
+        let mut device = attached(); device.config.minor = -1;
+        assert!(validate_growth_device(&device).is_err());
     }
 }

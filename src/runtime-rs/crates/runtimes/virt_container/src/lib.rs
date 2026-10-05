@@ -9,6 +9,7 @@ extern crate slog;
 
 logging::logger_with_subsystem!(sl, "virt-container");
 
+mod cleanup_once;
 mod container_manager;
 pub mod factory;
 pub mod health_check;

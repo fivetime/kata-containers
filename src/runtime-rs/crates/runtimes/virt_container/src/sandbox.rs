@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+use crate::cleanup_once::CleanupOnce;
 use crate::health_check::HealthCheck;
 use crate::oom::CrioOomNotifier;
 use agent::kata::KataAgent;
@@ -81,6 +82,7 @@ use resource::coco_data::initdata::{
 use resource::coco_data::initdata_block;
 use resource::manager::ManagerArgs;
 use resource::network::{dan_config_path, DanNetworkConfig, NetworkConfig, NetworkWithNetNsConfig};
+use resource::share_fs::nova_shares::{self, NovaShare};
 use resource::{ResourceConfig, ResourceManager};
 use runtime_spec as spec;
 use std::collections::HashSet;
@@ -120,11 +122,6 @@ struct SandboxInner {
     state: SandboxState,
     exit_info: Option<SandboxExitInfo>,
     created_at: Option<SystemTime>,
-    // Whether sandbox resources (cgroup, network, mounts, ...) have already
-    // been released.  Teardown can be driven both by the sandbox container
-    // exiting and by an explicit shutdown RPC, so guard against running the
-    // cleanup twice.
-    cleaned: bool,
 }
 
 impl SandboxInner {
@@ -133,7 +130,6 @@ impl SandboxInner {
             state: SandboxState::Init,
             exit_info: None,
             created_at: None,
-            cleaned: false,
         }
     }
 }
@@ -143,6 +139,7 @@ pub struct VirtSandbox {
     sid: String,
     msg_sender: Arc<Mutex<Sender<Message>>>,
     inner: Arc<RwLock<SandboxInner>>,
+    cleanup_once: Arc<CleanupOnce>,
     resource_manager: Arc<ResourceManager>,
     agent: Arc<dyn Agent>,
     hypervisor: Arc<dyn Hypervisor>,
@@ -190,6 +187,7 @@ impl VirtSandbox {
             sid: sid.to_string(),
             msg_sender: Arc::new(Mutex::new(msg_sender)),
             inner: Arc::new(RwLock::new(SandboxInner::new())),
+            cleanup_once: Arc::new(CleanupOnce::default()),
             agent,
             hypervisor,
             resource_manager,
@@ -263,6 +261,12 @@ impl VirtSandbox {
         let shared_fs = self.hypervisor.hypervisor_config().await.shared_fs;
         if shared_fs.shared_fs.is_some() {
             resource_configs.push(ResourceConfig::ShareFs(shared_fs));
+        }
+
+        // Nova shares (ADR-045): one virtio-fs device per share, cold-plugged.
+        let shares = self.nova_shares(sandbox_config).await?;
+        if !shares.is_empty() {
+            resource_configs.push(ResourceConfig::NovaShares(shares));
         }
 
         // prepare VM rootfs device config
@@ -341,6 +345,26 @@ impl VirtSandbox {
         }
 
         Ok(resource_configs)
+    }
+
+    /// The audited share request of the sandbox container (ADR-045); a
+    /// request the VMM cannot honour is refused with `share_unsupported:`.
+    async fn nova_shares(&self, sandbox_config: &SandboxConfig) -> Result<Vec<NovaShare>> {
+        let shares = nova_shares::parse(&sandbox_config.annotations)?;
+        if !shares.is_empty() {
+            let toml_config = self.resource_manager.config().await;
+            let supported = self
+                .hypervisor
+                .capabilities()
+                .await?
+                .is_fs_sharing_supported();
+            nova_shares::check_supported(
+                &toml_config.runtime.hypervisor_name,
+                &self.hypervisor.hypervisor_config().await,
+                supported,
+            )?;
+        }
+        Ok(shares)
     }
 
     async fn prepare_pcie_port_devices(&self) -> Option<PortDeviceConfig> {
@@ -1018,6 +1042,9 @@ impl Sandbox for VirtSandbox {
             warn!(sl!(), "sandbox is started");
             return Ok(());
         }
+        // A share request is refused before the VM is prepared (ADR-045).
+        self.nova_shares(sandbox_config).await?;
+
         let selinux_label = load_oci_spec().ok().and_then(|spec| {
             spec.process()
                 .as_ref()
@@ -1244,6 +1271,9 @@ impl Sandbox for VirtSandbox {
         if inner.state != SandboxState::Init {
             return Ok(());
         }
+        // A share request is refused before the VM is prepared (ADR-045).
+        self.nova_shares(sandbox_config).await?;
+
         let selinux_label = load_oci_spec().ok().and_then(|spec| {
             spec.process()
                 .as_ref()
@@ -1343,6 +1373,10 @@ impl Sandbox for VirtSandbox {
         // Cancel the OOM watcher before tearing down the VM so it exits
         // cleanly instead of hitting ECONNRESET/EOF on a closed channel.
         self.cancel_token.cancel();
+        // Likewise stop the health check: once the VM is stopped the agent is
+        // unreachable, and a failed check would exit the runtime before the
+        // sandbox cleanup and the reply to the pending shutdown request.
+        self.monitor.stop().await;
 
         info!(sl!(), "begin stop sandbox");
         if state == SandboxState::Init {
@@ -1382,50 +1416,46 @@ impl Sandbox for VirtSandbox {
     }
 
     async fn cleanup(&self) -> Result<()> {
-        // Teardown may be triggered both when the sandbox container exits and
-        // by a later shutdown RPC; only release the resources once.
-        {
-            let mut inner = self.inner.write().await;
-            if inner.cleaned {
-                return Ok(());
-            }
-            inner.cleaned = true;
-        }
+        // Serialize callers without holding SandboxInner across external IO.
+        // A failed or cancelled cleanup must not be reported as completed.
+        self.cleanup_once
+            .run(async {
+                let rootless_uid = self
+                    .hypervisor
+                    .hypervisor_config()
+                    .await
+                    .security_info
+                    .rootless_user
+                    .map(|user| user.uid);
 
-        let rootless_uid = self
-            .hypervisor
-            .hypervisor_config()
+                info!(sl!(), "delete hypervisor");
+                self.hypervisor
+                    .cleanup()
+                    .await
+                    .context("delete hypervisor")?;
+
+                info!(sl!(), "resource clean up");
+                self.resource_manager
+                    .cleanup()
+                    .await
+                    .context("resource clean up")?;
+
+                if let Some(uid) = rootless_uid {
+                    let path = vmm_user_runtime_dir(uid);
+                    if let Err(err) = remove_vmm_user_runtime_dir(uid) {
+                        warn!(
+                            sl!(),
+                            "failed to remove rootless runtime directory {}: {}",
+                            path.display(),
+                            err
+                        );
+                    }
+                }
+
+                // TODO: cleanup other sandbox resource
+                Ok(())
+            })
             .await
-            .security_info
-            .rootless_user
-            .map(|user| user.uid);
-
-        info!(sl!(), "delete hypervisor");
-        self.hypervisor
-            .cleanup()
-            .await
-            .context("delete hypervisor")?;
-
-        info!(sl!(), "resource clean up");
-        self.resource_manager
-            .cleanup()
-            .await
-            .context("resource clean up")?;
-
-        if let Some(uid) = rootless_uid {
-            let path = vmm_user_runtime_dir(uid);
-            if let Err(err) = remove_vmm_user_runtime_dir(uid) {
-                warn!(
-                    sl!(),
-                    "failed to remove rootless runtime directory {}: {}",
-                    path.display(),
-                    err
-                );
-            }
-        }
-
-        // TODO: cleanup other sandbox resource
-        Ok(())
     }
 
     async fn rescan_network(&self) -> Result<()> {
@@ -1674,6 +1704,7 @@ impl Persist for VirtSandbox {
             sid: sid.to_string(),
             msg_sender: Arc::new(Mutex::new(sandbox_args.sender)),
             inner: Arc::new(RwLock::new(SandboxInner::new())),
+            cleanup_once: Arc::new(CleanupOnce::default()),
             agent,
             hypervisor,
             resource_manager,

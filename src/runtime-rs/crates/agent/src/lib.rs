@@ -13,6 +13,7 @@ pub mod kata;
 mod log_forwarder;
 mod sock;
 pub mod types;
+pub use types::{AttachBlockDeviceRequest, DetachBlockDeviceRequest};
 pub use types::{
     ARPNeighbor, ARPNeighbors, AddArpNeighborRequest, AddSwapPathRequest, AddSwapRequest,
     BlkioStatsEntry, CheckRequest, CloseStdinRequest, ContainerID, ContainerProcessID,
@@ -76,6 +77,8 @@ pub trait Agent: AgentManager + HealthService + Send + Sync {
     async fn start_container(&self, req: ContainerID) -> Result<Empty>;
     async fn stats_container(&self, req: ContainerID) -> Result<StatsContainerResponse>;
     async fn update_container(&self, req: UpdateContainerRequest) -> Result<Empty>;
+    async fn attach_block_device(&self, req: AttachBlockDeviceRequest) -> Result<Empty>;
+    async fn detach_block_device(&self, req: DetachBlockDeviceRequest) -> Result<Empty>;
 
     // process
     async fn exec_process(&self, req: ExecProcessRequest) -> Result<Empty>;
@@ -108,3 +111,6 @@ pub trait Agent: AgentManager + HealthService + Send + Sync {
         req: GetDiagnosticDataRequest,
     ) -> Result<GetDiagnosticDataResponse>;
 }
+
+#[cfg(test)]
+mod block_attach_agent_tests;

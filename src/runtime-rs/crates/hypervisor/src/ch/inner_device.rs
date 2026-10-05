@@ -21,6 +21,7 @@ use crate::VmmState;
 use crate::{BlockConfigModern, BlockDeviceModern};
 use anyhow::{anyhow, Context, Result};
 use ch_config::ch_api::cloud_hypervisor_vm_device_add;
+use ch_config::ch_api::cloud_hypervisor_vm_info;
 use ch_config::ch_api::{
     cloud_hypervisor_vm_blockdev_add, cloud_hypervisor_vm_device_remove,
     cloud_hypervisor_vm_fs_add, cloud_hypervisor_vm_netdev_add_with_fds,
@@ -46,6 +47,12 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 const VIRTIO_FS: &str = "virtio-fs";
+
+// Nova Kata (ADR-044): the key of a network device in `device_ids`, where
+// block and VFIO devices are kept by their device id.
+fn network_device_key(host_dev_name: &str) -> String {
+    format!("network-{host_dev_name}")
+}
 
 impl CloudHypervisorInner {
     pub(crate) async fn add_device(&mut self, device: DeviceType) -> Result<DeviceType> {
@@ -287,16 +294,7 @@ impl CloudHypervisorInner {
             .is_direct
             .unwrap_or(self.config.blockdev_info.block_device_cache_direct);
 
-        disk_config.rate_limiter_config = RateLimiterConfig::new(
-            self.config.blockdev_info.disk_rate_limiter_bw_max_rate,
-            self.config.blockdev_info.disk_rate_limiter_ops_max_rate,
-            self.config
-                .blockdev_info
-                .disk_rate_limiter_bw_one_time_burst,
-            self.config
-                .blockdev_info
-                .disk_rate_limiter_ops_one_time_burst,
-        );
+        disk_config.rate_limiter_config = disk_rate_limiter(&self.config.blockdev_info, config)?;
 
         Ok(disk_config)
     }
@@ -362,9 +360,50 @@ impl CloudHypervisorInner {
 
         if let Some(detail) = response {
             debug!(sl!(), "netdev add response: {:?}", detail);
+            // The name the VMM gave the device is what removes it.
+            let dev_info: PciDeviceInfo =
+                serde_json::from_str(detail.as_str()).map_err(|e| anyhow!(e))?;
+            self.device_ids
+                .insert(network_device_key(&netdev.config.host_dev_name), dev_info.id);
         }
 
         Ok(DeviceType::Network(netdev))
+    }
+
+    // Nova Kata (ADR-044). A device that was added with the VM is known to
+    // the VMM by a name of its own choice; it is found by its MAC address.
+    pub(crate) async fn remove_network_device(&mut self, device: NetworkDevice) -> Result<()> {
+        let key = network_device_key(&device.config.host_dev_name);
+        if !self.device_ids.contains_key(&key) {
+            let mac = device
+                .config
+                .guest_mac
+                .as_ref()
+                .map(|mac| format!("{mac:?}"))
+                .ok_or_else(|| anyhow!("network_update_conflict: the device has no MAC"))?;
+            let info = cloud_hypervisor_vm_info(&self.api_socket)
+                .await
+                .context("read the devices of the VM")?;
+            let named: Vec<String> = info
+                .config
+                .net
+                .iter()
+                .flatten()
+                .filter(|net| net.mac.to_string().eq_ignore_ascii_case(&mac))
+                .filter_map(|net| net.id.clone())
+                .collect();
+            if named.len() != 1 {
+                return Err(anyhow!(
+                    "network_update_conflict: {} devices of the VM have the MAC {}",
+                    named.len(),
+                    mac
+                ));
+            }
+            self.device_ids.insert(key.clone(), named[0].clone());
+        }
+        self.inner_remove_device(&key).await?;
+        self.device_ids.remove(&key);
+        Ok(())
     }
 
     pub(crate) async fn get_shared_devices(
@@ -558,6 +597,75 @@ impl TryFrom<NetworkConfig> for NetConfig {
     }
 }
 
+/// The rate limiter of a disk: its own limits (openstack-nova-kata ADR-051),
+/// which refuse what Cloud Hypervisor cannot keep, or else the sandbox's.
+fn disk_rate_limiter(
+    blockdev_info: &kata_types::config::hypervisor::BlockDeviceInfo,
+    config: &BlockConfigModern,
+) -> Result<Option<RateLimiterConfig>> {
+    if let Some(limits) = config.io_limits.as_ref() {
+        return Ok(Some(limits.rate_limiter("cloud-hypervisor")?));
+    }
+    Ok(RateLimiterConfig::new(
+        blockdev_info.disk_rate_limiter_bw_max_rate,
+        blockdev_info.disk_rate_limiter_ops_max_rate,
+        blockdev_info.disk_rate_limiter_bw_one_time_burst,
+        blockdev_info.disk_rate_limiter_ops_one_time_burst,
+    ))
+}
+
+#[cfg(test)]
+mod nova_volume_qos_tests {
+    use super::*;
+    use crate::BlockIoLimits;
+
+    #[test]
+    fn nova_volume_qos_ch_disk_rate_limiter() {
+        let mut info = kata_types::config::hypervisor::BlockDeviceInfo {
+            disk_rate_limiter_bw_max_rate: 7,
+            disk_rate_limiter_ops_max_rate: 9,
+            ..Default::default()
+        };
+        info.disk_rate_limiter_ops_one_time_burst = Some(3);
+        let mut config = BlockConfigModern::default();
+        // Without limits of its own the disk keeps the sandbox's.
+        assert_eq!(
+            disk_rate_limiter(&info, &config).unwrap(),
+            RateLimiterConfig::new(7, 9, None, Some(3))
+        );
+        config.io_limits = Some(BlockIoLimits {
+            total_bytes_sec: Some(1048576),
+            total_iops_sec: Some(200),
+            ..Default::default()
+        });
+        let limiter = disk_rate_limiter(&info, &config).unwrap().unwrap();
+        let bandwidth = limiter.bandwidth.unwrap();
+        assert_eq!(
+            (bandwidth.size, bandwidth.one_time_burst, bandwidth.refill_time),
+            (1048576, None, 1000)
+        );
+        let ops = limiter.ops.unwrap();
+        assert_eq!((ops.size, ops.one_time_burst, ops.refill_time), (200, None, 1000));
+        let mut disk = DiskConfig::try_from(config.clone()).unwrap();
+        disk.rate_limiter_config = disk_rate_limiter(&info, &config).unwrap();
+        let json = serde_json::to_value(&disk).unwrap();
+        assert_eq!(json["rate_limiter_config"]["bandwidth"]["size"], 1048576);
+        assert!(json["rate_limiter_config"]["bandwidth"]["one_time_burst"].is_null());
+        assert_eq!(json["rate_limiter_config"]["ops"]["size"], 200);
+        assert_eq!(json["rate_limiter_config"]["ops"]["refill_time"], 1000);
+        // Read, write and size limits are refused, not approximated.
+        config.io_limits = Some(BlockIoLimits {
+            total_iops_sec: Some(200),
+            size_iops_sec: Some(4096),
+            ..Default::default()
+        });
+        assert_eq!(
+            disk_rate_limiter(&info, &config).unwrap_err().to_string(),
+            "volume_qos_unsupported: cloud-hypervisor cannot keep size_iops_sec"
+        );
+    }
+}
+
 impl TryFrom<BlockConfigModern> for DiskConfig {
     type Error = anyhow::Error;
 
@@ -658,5 +766,44 @@ mod tests {
         let net = NetConfig::try_from(cfg);
         assert!(net.is_ok());
         assert_eq!(net.unwrap(), expected);
+    }
+}
+
+#[cfg(test)]
+mod nova_shares_ch_tests {
+    use super::*;
+
+    #[test]
+    fn nova_shares_ch_boot_fs_configs() {
+        let vm_path = String::from("/run/kata/s");
+        let config = |tag: &str, sock: &str| ShareFsConfig {
+            host_shared_path: String::from("/srv/share"),
+            fs_type: String::from(VIRTIO_FS),
+            sock_path: String::from(sock),
+            mount_tag: String::from(tag),
+            queue_size: 1024,
+            queue_num: 1,
+            ..Default::default()
+        };
+        let main = FsConfig::try_from(ShareFsSettings::new(
+            config("kataShared", "/run/kata/s/root/virtiofsd.sock"),
+            vm_path.clone(),
+        ))
+        .unwrap();
+        let share = FsConfig::try_from(ShareFsSettings::new(
+            config("share-a", "/run/kata/s/root/virtiofsd-share-0.sock"),
+            vm_path,
+        ))
+        .unwrap();
+        assert_eq!(share.tag, "share-a");
+        assert_eq!(
+            share.socket,
+            PathBuf::from("/run/kata/s/root/virtiofsd-share-0.sock")
+        );
+        assert_eq!((share.num_queues, share.queue_size), (1, 1024));
+        // Cloud Hypervisor names a device without an id itself (_fs0, _fs1).
+        assert!(main.id.is_none() && share.id.is_none());
+        assert_ne!(main.tag, share.tag);
+        assert_ne!(main.socket, share.socket);
     }
 }

@@ -45,6 +45,25 @@ pub(crate) async fn attach_network_device(
 
 #[async_trait]
 pub trait Endpoint: std::fmt::Debug + Send + Sync {
+    /// Nova Kata (ADR-044): the interface of the host the VMM holds for
+    /// this endpoint, for the endpoints that can leave a running guest.
+    async fn host_interface(&self) -> Option<String> {
+        None
+    }
+    /// Nova Kata (ADR-044): take the device from the running guest, then
+    /// what connects the two interfaces. With `keep` the host interface
+    /// stays; without, it is deleted.
+    async fn hot_detach(&self, _keep: bool) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "network_update_unsupported: this endpoint leaves no running guest"
+        ))
+    }
+    /// Nova Kata (ADR-044): remove what an attach that failed has made.
+    async fn discard(&self) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "network_update_unsupported: this endpoint leaves no running guest"
+        ))
+    }
     async fn name(&self) -> String;
     async fn hardware_addr(&self) -> String;
     async fn attach(&self) -> Result<Option<String>>;

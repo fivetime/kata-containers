@@ -45,10 +45,14 @@ struct NetworkWithNetnsInner {
     netns_path: String,
     entity_list: Vec<NetworkEntity>,
     network_created: bool,
+    // Nova Kata (ADR-044): what an endpoint that joins later is made with.
+    config: NetworkWithNetNsConfig,
+    device_manager: Arc<RwLock<DeviceManager>>,
 }
 
 impl NetworkWithNetnsInner {
     async fn new(config: &NetworkWithNetNsConfig, d: Arc<RwLock<DeviceManager>>) -> Result<Self> {
+        let device_manager = d.clone();
         let entity_list = if config.netns_path.is_empty() {
             warn!(sl!(), "Skip to scan network for empty netns");
             vec![]
@@ -68,8 +72,29 @@ impl NetworkWithNetnsInner {
             netns_path: config.netns_path.to_string(),
             entity_list,
             network_created: config.network_created,
+            config: config.clone(),
+            device_manager,
         })
     }
+}
+
+// Nova Kata (ADR-044).
+const MAX_HOST_INTERFACES: u32 = 4096;
+
+async fn set_alias(handle: &rtnetlink::Handle, name: &str, alias: &str) -> Result<()> {
+    let link = super::network_pair::get_link_by_name(handle, name)
+        .await
+        .context("get link by name")?;
+    handle
+        .link()
+        .set(
+            rtnetlink::LinkUnspec::new_with_index(link.attrs().index)
+                .alias(alias)
+                .build(),
+        )
+        .execute()
+        .await
+        .with_context(|| format!("label {name}"))
 }
 
 pub(crate) struct NetworkWithNetns {
@@ -89,6 +114,217 @@ impl NetworkWithNetns {
 
 #[async_trait]
 impl Network for NetworkWithNetns {
+    async fn attach_endpoint(
+        &self,
+        update: &super::EndpointUpdate,
+    ) -> Result<super::AttachedEndpoint> {
+        let mut inner = self.inner.write().await;
+        if inner.netns_path.is_empty()
+            || inner.config.network_model != crate::network::network_model::TC_FILTER_NET_MODEL_STR
+        {
+            return Err(anyhow!(
+                "network_update_unsupported: the sandbox has no namespace of the tcfilter model"
+            ));
+        }
+        let _netns_guard = netns::NetnsGuard::new(&inner.netns_path).context("net netns guard")?;
+        let (connection, handle, _) = rtnetlink::new_connection().context("new connection")?;
+        let thread_handler = tokio::spawn(connection);
+        defer!({
+            thread_handler.abort();
+        });
+
+        for e in &inner.entity_list {
+            if e.endpoint.name().await == update.interface {
+                // The same request again.
+                let host_interface = e.endpoint.host_interface().await.ok_or_else(|| {
+                    anyhow!("network_update_conflict: the interface is of another kind")
+                })?;
+                return Ok(super::AttachedEndpoint {
+                    interface: e.network_info.interface().await.context("interface")?,
+                    host_interface,
+                });
+            }
+        }
+
+        let link = super::network_pair::get_link_by_name(&handle, &update.interface)
+            .await
+            .context("network_update_conflict: the interface is not in the namespace")?;
+        let attrs = link.attrs();
+        let mac = super::utils::get_mac_addr(&attrs.hardware_addr).context("get mac addr")?;
+        if link.r#type() != "veth"
+            || !mac.eq_ignore_ascii_case(&update.mac)
+            || attrs.mtu != update.mtu
+        {
+            return Err(anyhow!(
+                "network_update_conflict: the interface {} is not what was announced",
+                update.interface
+            ));
+        }
+        let addrs = handle_addresses(&handle, attrs)
+            .await
+            .context("handle addresses")?;
+        if addrs.is_empty() {
+            return Err(anyhow!(
+                "network_update_conflict: the interface {} has no address",
+                update.interface
+            ));
+        }
+        // The least index no host interface of the namespace has.
+        let mut idx = 0u32;
+        while super::network_pair::get_link_by_name(&handle, &format!("tap{idx}_kata"))
+            .await
+            .is_ok()
+        {
+            idx += 1;
+            if idx > MAX_HOST_INTERFACES {
+                return Err(anyhow!("network_update_conflict: no host interface is free"));
+            }
+        }
+
+        let (endpoint, network_info) = create_endpoint(
+            &handle,
+            link.as_ref(),
+            addrs,
+            idx,
+            &inner.config,
+            inner.device_manager.clone(),
+        )
+        .await
+        .context("create endpoint")?;
+        let host_interface = endpoint
+            .host_interface()
+            .await
+            .ok_or_else(|| anyhow!("network_update_conflict: the interface is of another kind"))?;
+        let attached = async {
+            set_alias(&handle, &host_interface, &update.alias("pending")).await?;
+            if let Some(device_path) = endpoint.attach().await.context("attach")? {
+                network_info
+                    .set_device_path(device_path)
+                    .await
+                    .context("set device path")?;
+            }
+            network_info.interface().await.context("interface")
+        }
+        .await;
+        let interface = match attached {
+            Ok(interface) => interface,
+            Err(e) => {
+                // The guest has nothing of it.
+                if let Err(undo) = endpoint.discard().await {
+                    warn!(sl!(), "failed to discard endpoint: {:?}", undo);
+                }
+                return Err(e);
+            }
+        };
+        inner
+            .entity_list
+            .push(NetworkEntity::new(endpoint, network_info));
+        Ok(super::AttachedEndpoint {
+            interface,
+            host_interface,
+        })
+    }
+
+    async fn confirm_endpoint(&self, update: &super::EndpointUpdate) -> Result<()> {
+        let inner = self.inner.read().await;
+        let _netns_guard = netns::NetnsGuard::new(&inner.netns_path).context("net netns guard")?;
+        let (connection, handle, _) = rtnetlink::new_connection().context("new connection")?;
+        let thread_handler = tokio::spawn(connection);
+        defer!({
+            thread_handler.abort();
+        });
+        for e in &inner.entity_list {
+            if e.endpoint.name().await == update.interface {
+                let host_interface = e.endpoint.host_interface().await.ok_or_else(|| {
+                    anyhow!("network_update_conflict: the interface is of another kind")
+                })?;
+                return set_alias(&handle, &host_interface, &update.alias("attached")).await;
+            }
+        }
+        Err(anyhow!(
+            "network_update_conflict: the guest has no interface {}",
+            update.interface
+        ))
+    }
+
+    async fn refresh(&self) -> Result<()> {
+        let mut inner = self.inner.write().await;
+        let _netns_guard = netns::NetnsGuard::new(&inner.netns_path).context("net netns guard")?;
+        let (connection, handle, _) = rtnetlink::new_connection().context("new connection")?;
+        let thread_handler = tokio::spawn(connection);
+        defer!({
+            thread_handler.abort();
+        });
+        for e in inner.entity_list.iter_mut() {
+            let name = e.endpoint.name().await;
+            let link = super::network_pair::get_link_by_name(&handle, &name)
+                .await
+                .context("network_update_conflict: an interface of the guest is gone")?;
+            let addrs = handle_addresses(&handle, link.attrs())
+                .await
+                .context("handle addresses")?;
+            let device_path = e.network_info.interface().await?.device_path;
+            let network_info = Arc::new(
+                NetworkInfoFromLink::new(
+                    &handle,
+                    link.as_ref(),
+                    addrs,
+                    &e.endpoint.hardware_addr().await,
+                )
+                .await
+                .context("network info from link")?,
+            );
+            if !device_path.is_empty() {
+                network_info
+                    .set_device_path(device_path)
+                    .await
+                    .context("set device path")?;
+            }
+            e.network_info = network_info;
+        }
+        Ok(())
+    }
+
+    async fn detach_endpoint(&self, update: &super::EndpointUpdate, keep: bool) -> Result<()> {
+        let mut inner = self.inner.write().await;
+        let _netns_guard = netns::NetnsGuard::new(&inner.netns_path).context("net netns guard")?;
+        let (connection, handle, _) = rtnetlink::new_connection().context("new connection")?;
+        let thread_handler = tokio::spawn(connection);
+        defer!({
+            thread_handler.abort();
+        });
+        let mut position = None;
+        for (index, e) in inner.entity_list.iter().enumerate() {
+            if e.endpoint.name().await == update.interface
+                && e.endpoint
+                    .hardware_addr()
+                    .await
+                    .eq_ignore_ascii_case(&update.mac)
+            {
+                position = Some(index);
+            }
+        }
+        let position = position.ok_or_else(|| {
+            anyhow!(
+                "network_update_conflict: the guest has no interface {}",
+                update.interface
+            )
+        })?;
+        // The last interface leaves as any other: an instance of Nova may
+        // have none, and may be given its first one later.
+        let endpoint = inner.entity_list[position].endpoint.clone();
+        let host_interface = endpoint
+            .host_interface()
+            .await
+            .ok_or_else(|| anyhow!("network_update_conflict: the interface is of another kind"))?;
+        endpoint.hot_detach(keep).await.context("detach")?;
+        inner.entity_list.remove(position);
+        if keep {
+            set_alias(&handle, &host_interface, &update.alias("released")).await?;
+        }
+        Ok(())
+    }
+
     async fn setup(&self) -> Result<()> {
         let inner = self.inner.read().await;
         let _netns_guard = netns::NetnsGuard::new(&inner.netns_path).context("net netns guard")?;

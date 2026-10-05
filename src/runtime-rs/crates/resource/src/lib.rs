@@ -37,6 +37,8 @@ use kata_types::config::hypervisor::SharedFsInfo;
 pub enum ResourceConfig {
     Network(NetworkConfig),
     ShareFs(SharedFsInfo),
+    /// Nova shares (ADR-045): one virtio-fs device each, before the VM boots.
+    NovaShares(Vec<share_fs::nova_shares::NovaShare>),
     VmRootfs(BlockConfigModern),
     GuestExtensionImage(BlockConfigModern),
     HybridVsock(HybridVsockConfig),

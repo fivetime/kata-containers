@@ -27,4 +27,7 @@ pub const SECTOR_SIZE: u64 = (0x01u64) << (SECTOR_SHIFT as u64);
 pub(crate) enum KillEvent {
     Kill,
     BucketUpdate(BucketUpdate, BucketUpdate),
+    /// Take the capacity of the backend again; the answer is the capacity
+    /// the queue now checks requests against (openstack-nova-kata ADR-033).
+    Resize(u64, std::sync::mpsc::Sender<std::result::Result<u64, String>>),
 }

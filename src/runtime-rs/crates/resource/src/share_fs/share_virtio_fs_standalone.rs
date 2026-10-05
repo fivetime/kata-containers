@@ -47,7 +47,7 @@ pub struct ShareVirtioFsStandaloneConfig {
 
 #[derive(Default, Debug)]
 struct ShareVirtioFsStandaloneInner {
-    pid: Option<u32>,
+    process: Option<VirtiofsProcess>,
 }
 
 pub(crate) struct ShareVirtioFsStandalone {
@@ -79,25 +79,13 @@ impl ShareVirtioFsStandalone {
             .to_str()
             .ok_or_else(|| anyhow!("convert source path {:?} to str failed", source_path))?;
 
-        let mut args: Vec<String> = vec![
-            String::from("--socket-path"),
-            String::from(sock_path),
-            String::from("--shared-dir"),
-            String::from(shared_dir),
-            String::from("--cache"),
-            self.config.virtio_fs_cache.clone(),
-        ];
-
-        if !self.config.virtio_fs_extra_args.is_empty() {
-            let mut extra_args: Vec<String> = self.config.virtio_fs_extra_args.clone();
-            args.append(&mut extra_args);
-        }
-
-        if !disable_guest_selinux {
-            args.push(String::from("--xattr"));
-        }
-
-        Ok(args)
+        Ok(virtiofsd_base_args(
+            sock_path,
+            shared_dir,
+            &self.config.virtio_fs_cache,
+            &self.config.virtio_fs_extra_args,
+            disable_guest_selinux,
+        ))
     }
 
     async fn setup_virtiofsd(&self, h: &dyn Hypervisor) -> Result<()> {
@@ -146,14 +134,11 @@ impl ShareVirtioFsStandalone {
             chown_to_parent(&sock_path)?;
         }
 
-        // update virtiofsd pid{
+        let (tx, mut rx): (Sender<Result<()>>, Receiver<Result<()>>) = channel(100);
         {
             let mut inner = self.inner.write().await;
-            inner.pid = child.id();
+            inner.process = Some(VirtiofsProcess::spawn(child, tx));
         }
-
-        let (tx, mut rx): (Sender<Result<()>>, Receiver<Result<()>>) = channel(100);
-        tokio::spawn(run_virtiofsd(child, tx));
 
         // TODO: support timeout
         match rx.recv().await.unwrap() {
@@ -174,39 +159,44 @@ impl ShareVirtioFsStandalone {
     async fn shutdown_virtiofsd(&self) -> Result<()> {
         let mut inner = self.inner.write().await;
 
-        if let Some(pid) = inner.pid.take() {
-            info!(sl!(), "shutdown virtiofsd pid {}", pid);
-            let pid = ::nix::unistd::Pid::from_raw(pid as i32);
-            if let Err(err) = ::nix::sys::signal::kill(pid, nix::sys::signal::SIGKILL) {
-                if err != ::nix::Error::ESRCH {
-                    return Err(anyhow!("failed to kill virtiofsd pid {} {}", pid, err));
-                }
-            }
+        if let Some(process) = inner.process.as_mut() {
+            process.stop().await.context("stop and reap virtiofsd")?;
         }
-        inner.pid = None;
+        inner.process = None;
 
         Ok(())
     }
 }
 
-async fn run_virtiofsd(mut child: Child, tx: Sender<Result<()>>) -> Result<()> {
-    let stderr = child.stderr.as_mut().unwrap();
-    let stderr_reader = BufReader::new(stderr);
-    let mut lines = stderr_reader.lines();
+/// The virtiofsd arguments common to the sandbox daemon and the Nova share
+/// daemons (ADR-045): socket, shared directory, cache mode, the configured
+/// extra arguments and `--xattr` unless guest SELinux is disabled.
+pub(crate) fn virtiofsd_base_args(
+    sock_path: &str,
+    shared_dir: &str,
+    cache: &str,
+    extra_args: &[String],
+    disable_guest_selinux: bool,
+) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        String::from("--socket-path"),
+        String::from(sock_path),
+        String::from("--shared-dir"),
+        String::from(shared_dir),
+        String::from("--cache"),
+        cache.to_string(),
+    ];
 
-    while let Some(buffer) = lines.next_line().await.context("read next line")? {
-        let trim_buffer = buffer.trim_end();
-        if !trim_buffer.is_empty() {
-            info!(sl!(), "source: virtiofsd {}", trim_buffer);
-        }
-        if buffer.contains("Waiting for vhost-user socket connection") {
-            tx.send(Ok(())).await.unwrap();
-        }
+    args.extend(extra_args.iter().cloned());
+
+    if !disable_guest_selinux {
+        args.push(String::from("--xattr"));
     }
 
-    info!(sl!(), "wait virtiofsd {:?}", child.wait().await);
-    Ok(())
+    args
 }
+
+include!("virtiofs_process.rs");
 
 #[async_trait]
 impl ShareFs for ShareVirtioFsStandalone {

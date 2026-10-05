@@ -690,3 +690,41 @@ impl Default for FsDeviceMgr {
         }
     }
 }
+
+#[cfg(test)]
+mod nova_shares_tests {
+    use super::*;
+
+    fn config(tag: &str, mode: &str, sock_path: &str) -> FsDeviceConfigInfo {
+        FsDeviceConfigInfo {
+            tag: tag.to_string(),
+            mode: mode.to_string(),
+            sock_path: sock_path.to_string(),
+            ..Default::default()
+        }
+    }
+
+    // Nova shares (ADR-045): vhost-user-fs devices next to the inline one.
+    #[test]
+    fn nova_shares_vhostuser_devices_next_to_inline() {
+        let mut list = DeviceConfigInfos::<FsDeviceConfigInfo>::new();
+        list.insert_or_update(&config("kataShared", VIRTIO_FS_MODE, ""))
+            .unwrap();
+        let a = "/run/kata/s/root/a.sock";
+        let b = "/run/kata/s/root/b.sock";
+        list.insert_or_update(&config("share-a", VHOSTUSER_FS_MODE, a))
+            .unwrap();
+        list.insert_or_update(&config("share-b", VHOSTUSER_FS_MODE, b))
+            .unwrap();
+        assert_eq!(list.len(), 3);
+        assert!(list
+            .insert_or_update(&config("share-c", VHOSTUSER_FS_MODE, a))
+            .is_err());
+        assert_eq!(list.len(), 3);
+        let modes: Vec<_> = list.iter().map(|info| info.config.mode.clone()).collect();
+        assert_eq!(
+            modes,
+            vec![VIRTIO_FS_MODE, VHOSTUSER_FS_MODE, VHOSTUSER_FS_MODE]
+        );
+    }
+}

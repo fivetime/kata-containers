@@ -296,6 +296,7 @@ impl TryFrom<api::UpdateTaskRequest> for TaskRequest {
         Ok(TaskRequest::UpdateContainer(UpdateRequest {
             container_id: from.id.to_string(),
             value: from.resources().value.to_vec(),
+            annotations: from.annotations.clone(),
         }))
     }
 }

@@ -335,4 +335,35 @@ pub struct StatsInfo {
 pub struct UpdateRequest {
     pub container_id: String,
     pub value: Vec<u8>,
+    pub annotations: HashMap<String, String>,
+}
+
+impl UpdateRequest {
+    // This is the resource-only route. A dedicated device-update dispatcher
+    // must handle supported versions before calling it; never ignore requests
+    // for an unimplemented device mutation while reporting resource success.
+    pub fn ensure_resource_only(&self) -> Result<()> {
+        if self.annotations.keys().any(|key| {
+            key.starts_with("io.katacontainers.volume-update.")
+        }) {
+            anyhow::bail!("volume_update_unsupported: running device updates are unavailable");
+        }
+        // Nova Kata (ADR-044): likewise a change of the interfaces.
+        if self.annotations.keys().any(|key| {
+            key.starts_with("io.katacontainers.network-update.")
+        }) {
+            anyhow::bail!("network_update_unsupported: running interface updates are unavailable");
+        }
+        // And any other mutation that is announced the same way, as
+        // io.katacontainers.<what>-update.<version>, and that no dispatcher
+        // took: resources are never updated in its place.
+        if self.annotations.keys().any(|key| {
+            key.strip_prefix("io.katacontainers.")
+                .and_then(|rest| rest.split_once('.'))
+                .map_or(false, |(what, _)| what.ends_with("-update"))
+        }) {
+            anyhow::bail!("device_update_unsupported: an update that no dispatcher knows");
+        }
+        Ok(())
+    }
 }

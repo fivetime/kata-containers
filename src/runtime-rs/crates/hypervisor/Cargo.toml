@@ -84,6 +84,8 @@ dragonball = { workspace = true, features = [
     "virtio-balloon",
     "virtio-rng",
     "vhost-user-net",
+    # Nova shares (ADR-045): an external virtiofsd per share.
+    "vhost-user-fs",
     "host-device",
 ], optional = true }
 

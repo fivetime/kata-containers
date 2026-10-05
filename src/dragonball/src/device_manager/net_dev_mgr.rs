@@ -468,6 +468,76 @@ impl NetworkDeviceMgr {
         Ok(())
     }
 
+    /// Nova Kata (ADR-044): ask the guest to release the device; its answer
+    /// is sent to `result_sender`. As `BlockDeviceMgr::prepare_remove_device`.
+    pub fn prepare_remove_device(
+        &self,
+        ctx: &DeviceOpContext,
+        iface_id: &str,
+        result_sender: std::sync::mpsc::Sender<Option<i32>>,
+    ) -> std::result::Result<(), NetworkDeviceError> {
+        use dbs_upcall::{DevMgrResponse, UpcallClientResponse};
+
+        if !cfg!(feature = "hotplug") {
+            return Err(NetworkDeviceError::UpdateNotAllowedPostBoot);
+        }
+        let index = self
+            .get_index_of_iface_id(iface_id)
+            .ok_or_else(|| NetworkDeviceError::InvalidIfaceId(iface_id.to_owned()))?;
+        let device = self.info_list[index]
+            .device
+            .as_ref()
+            .ok_or_else(|| NetworkDeviceError::InvalidIfaceId(iface_id.to_owned()))?;
+        if device.as_any().downcast_ref::<DbsMmioV2Device>().is_none() {
+            return Err(NetworkDeviceError::InvalidIfaceId(iface_id.to_owned()));
+        }
+
+        let callback: Option<Box<dyn Fn(UpcallClientResponse) + Send>> =
+            Some(Box::new(move |result| match result {
+                UpcallClientResponse::DevMgr(DevMgrResponse::Other(resp)) => {
+                    if let Err(e) = result_sender.send(Some(resp.result)) {
+                        log::error!("send upcall result failed, due to {e:?}!");
+                    }
+                }
+                UpcallClientResponse::UpcallReset => {
+                    if let Err(e) = result_sender.send(None) {
+                        log::error!("send upcall result failed, due to {e:?}!");
+                    }
+                }
+                #[allow(unreachable_patterns)]
+                _ => {
+                    log::debug!("this arm should only be triggered under test");
+                }
+            }));
+        ctx.remove_hotplug_mmio_device(device, callback)
+            .map_err(NetworkDeviceError::DeviceManager)
+    }
+
+    /// Nova Kata (ADR-044): destroy the device the guest has released. The
+    /// inverse of `insert_device` for a device that was attached.
+    pub fn remove_device(
+        &mut self,
+        mut ctx: DeviceOpContext,
+        iface_id: &str,
+    ) -> std::result::Result<(), NetworkDeviceError> {
+        if !cfg!(feature = "hotplug") {
+            return Err(NetworkDeviceError::UpdateNotAllowedPostBoot);
+        }
+        let index = self
+            .get_index_of_iface_id(iface_id)
+            .ok_or_else(|| NetworkDeviceError::InvalidIfaceId(iface_id.to_owned()))?;
+        let mut info = self
+            .info_list
+            .remove(index)
+            .ok_or_else(|| NetworkDeviceError::InvalidIfaceId(iface_id.to_owned()))?;
+        slog::info!(ctx.logger(), "remove network device: {}", info.config.id());
+        if let Some(device) = info.device.take() {
+            DeviceManager::destroy_mmio_device(device, &mut ctx)
+                .map_err(NetworkDeviceError::DeviceManager)?;
+        }
+        Ok(())
+    }
+
     /// Update the ratelimiter settings of a virtio-net device.
     ///
     /// Only the virtio-net backend implements rate limiting; the request is

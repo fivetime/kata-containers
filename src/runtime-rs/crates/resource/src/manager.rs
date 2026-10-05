@@ -84,6 +84,24 @@ impl ResourceManager {
         inner.handle_network(network_config).await
     }
 
+    /// Nova Kata (ADR-044): an interface of the namespace joins or leaves
+    /// the running guest.
+    pub async fn update_network(
+        &self,
+        update: crate::network::EndpointUpdate,
+        attach: bool,
+    ) -> Result<()> {
+        let inner = self.inner.write().await;
+        inner.update_network(update, attach).await
+    }
+
+    /// Nova Kata (ADR-044): the routes of the namespace have changed; the
+    /// guest is given those of the interfaces it has.
+    pub async fn refresh_network(&self) -> Result<()> {
+        let inner = self.inner.write().await;
+        inner.refresh_network().await
+    }
+
     #[instrument]
     pub async fn setup_after_start_vm(&self) -> Result<()> {
         let mut inner = self.inner.write().await;

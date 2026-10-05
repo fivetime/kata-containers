@@ -207,6 +207,14 @@ pub fn create_mount_destination<S: AsRef<Path>, D: AsRef<Path>, R: AsRef<Path>>(
     if fs_type == "bind" {
         // The source and destination for bind mounting must be the same type: file or directory.
         if !src.as_ref().is_dir() {
+            // runtime-rs precreates file mountpoints on its shared filesystem.
+            // A bind mount over an existing file needs no write access to it.
+            // In particular, opening it for writing fails on a read-only share.
+            if let Ok(metadata) = fs::symlink_metadata(dst) {
+                if metadata.file_type().is_file() {
+                    return Ok(dst.to_path_buf());
+                }
+            }
             fs::OpenOptions::new()
                 .mode(MOUNT_FILE_PERM)
                 .write(true)

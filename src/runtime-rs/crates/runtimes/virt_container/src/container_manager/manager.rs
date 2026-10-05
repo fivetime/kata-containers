@@ -450,6 +450,25 @@ impl ContainerManager for VirtContainerManager {
 
     #[instrument]
     async fn update_container(&self, req: UpdateRequest) -> Result<()> {
+        if let Some(update) = super::live_network::parse(&req)? {
+            let containers = self.containers.read().await;
+            let container = containers.get(&req.container_id)
+                .ok_or_else(|| Error::ContainerNotFound(req.container_id.clone()))?;
+            return container.update_live_network(update).await;
+        }
+        if let Some(growth) = super::live_volume_growth::parse(&req)? {
+            let containers = self.containers.read().await;
+            let container = containers.get(&req.container_id)
+                .ok_or_else(|| Error::ContainerNotFound(req.container_id.clone()))?;
+            return container.grow_live_volume(growth).await;
+        }
+        if let Some(volume) = super::live_volume::parse(&req)? {
+            let containers = self.containers.read().await;
+            let container = containers.get(&req.container_id)
+                .ok_or_else(|| Error::ContainerNotFound(req.container_id.clone()))?;
+            return container.attach_live_volume(volume).await;
+        }
+        req.ensure_resource_only()?;
         let resource = serde_json::from_slice::<oci::LinuxResources>(&req.value)
             .context("deserialize LinuxResource")?;
         let containers = self.containers.read().await;

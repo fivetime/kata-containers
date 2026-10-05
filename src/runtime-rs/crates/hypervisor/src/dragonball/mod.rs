@@ -152,6 +152,21 @@ impl Hypervisor for Dragonball {
         inner.remove_device(device).await
     }
 
+    fn supports_network_removal(&self) -> bool {
+        true
+    }
+    fn supports_block_growth(&self) -> bool {
+        true
+    }
+    async fn grow_block_device(&self, device: DeviceType, requested: u64) -> Result<()> {
+        let mut inner = self.inner.write().await;
+        inner.grow_block_device(device, requested).await
+    }
+    async fn remove_network_device(&self, device: crate::NetworkDevice) -> Result<()> {
+        let mut inner = self.inner.write().await;
+        inner.remove_network_device(device).await
+    }
+
     async fn update_device(&self, device: DeviceType) -> Result<()> {
         let mut inner = self.inner.write().await;
         inner.update_device(device).await

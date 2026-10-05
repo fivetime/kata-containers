@@ -180,6 +180,10 @@ pub struct BlockConfigModern {
     /// `/dev/disk/by-id/virtio-<serial>`.
     /// If empty, the default `image-{device_id}` serial is used.
     pub serial_override: String,
+
+    /// Limits of this device alone, from its direct volume's metadata
+    /// (openstack-nova-kata ADR-051). None keeps the sandbox's limits.
+    pub io_limits: Option<super::volume_qos::BlockIoLimits>,
 }
 
 #[derive(Debug, Clone, Default)]

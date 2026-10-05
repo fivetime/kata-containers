@@ -80,14 +80,54 @@ impl NetworkModel for TcFilterModel {
         Ok(())
     }
 
+    async fn release(&self, pair: &NetworkPair) -> Result<()> {
+        let (connection, handle, _) = rtnetlink::new_connection().context("new connection")?;
+        let thread_handler = tokio::spawn(connection);
+        defer!({
+            thread_handler.abort();
+        });
+        // The filters of an interface go with its ingress qdisc.
+        for name in [&pair.virt_iface.name, &pair.tap.tap_iface.name] {
+            let index = fetch_index(&handle, name).await?;
+            let mut removal = handle.qdisc().del(index as i32);
+            removal.message_mut().header.parent = netlink_packet_route::tc::TcHandle::INGRESS;
+            removal.message_mut().header.handle = 0xffff0000u32.into();
+            removal
+                .execute()
+                .await
+                .with_context(|| format!("delete ingress qdisc of {name}"))?;
+        }
+        Ok(())
+    }
+
     async fn del(&self, pair: &NetworkPair) -> Result<()> {
         let (connection, handle, _) = rtnetlink::new_connection().context("new connection")?;
         let thread_handler = tokio::spawn(connection);
         defer!({
             thread_handler.abort();
         });
+        // NetworkPair created this persistent TAP. Removing only the veth
+        // qdisc leaves it in a caller-owned namespace and breaks the next boot.
+        let tap = crate::network::network_pair::get_link_by_name(&handle, &pair.tap.tap_iface.name)
+            .await?;
+        let mac = crate::network::utils::get_mac_addr(&tap.attrs().hardware_addr)?;
+        if tap.r#type() != "tuntap" || mac != pair.virt_iface.hard_addr {
+            anyhow::bail!("owned TAP identity changed before detach");
+        }
         let virt_index = fetch_index(&handle, &pair.virt_iface.name).await?;
-        handle.qdisc().del(virt_index as i32).execute().await?;
+        let mut removal = handle.qdisc().del(virt_index as i32);
+        removal.message_mut().header.parent = netlink_packet_route::tc::TcHandle::INGRESS;
+        removal.message_mut().header.handle = 0xffff0000u32.into();
+        removal
+            .execute()
+            .await
+            .context("delete peer ingress qdisc")?;
+        handle
+            .link()
+            .del(tap.attrs().index)
+            .execute()
+            .await
+            .context("delete owned TAP")?;
         Ok(())
     }
 }

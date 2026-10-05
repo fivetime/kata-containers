@@ -9,6 +9,7 @@ use crate::qemu::cmdline_generator::{CcwSubChannel, DeviceVirtioNet, Netdev, QMP
 use crate::utils::get_jailer_root;
 use crate::VcpuThreadIds;
 use crate::VmdkConfig;
+use crate::BlockIoLimits;
 
 use anyhow::{anyhow, Context, Result};
 use kata_types::config::hypervisor::{VIRTIO_BLK_CCW, VIRTIO_SCSI};
@@ -1088,6 +1089,51 @@ impl Qmp {
         Ok(())
     }
 
+    /// Nova Kata (ADR-044): a network device of the command line holds this
+    /// slot of the bridge.
+    pub fn record_network_device(&mut self, bridge_id: &str, slot: i64, host_dev_name: &str) {
+        self.record_pci_bridge_slot(
+            bridge_id,
+            slot,
+            &format!("frontend-network-{host_dev_name}"),
+        );
+    }
+
+    /// Nova Kata (ADR-044): the inverse of hotplug_network_device. The tap
+    /// backend is deleted only after the guest has released the device;
+    /// with it QEMU closes the descriptors of the host interface.
+    pub fn hotunplug_network_device(&mut self, host_dev_name: &str) -> Result<()> {
+        let netdev_id = format!("network-{host_dev_name}");
+        let frontend_id = format!("frontend-{netdev_id}");
+
+        self.qmp
+            .execute(&qmp::device_del {
+                id: frontend_id.clone(),
+            })
+            .map_err(|e| anyhow!("device_del for network device {}: {:?}", frontend_id, e))?;
+        self.wait_for_device_deleted(&frontend_id, DEVICE_DELETED_TIMEOUT)
+            .context("hotunplug_network_device(): waiting for DEVICE_DELETED")?;
+        self.qmp
+            .execute(&qmp::netdev_del {
+                id: netdev_id.clone(),
+            })
+            .map_err(|e| anyhow!("netdev_del for network device {}: {:?}", netdev_id, e))?;
+
+        for devices in self.pci_bridge_devices.values_mut() {
+            devices.retain(|_, id| id != &frontend_id);
+        }
+        if crate::utils::uses_native_ccw_bus() {
+            if let Some(subchannel) = self.ccw_subchannel.as_mut() {
+                let _ = subchannel.remove_device(&frontend_id);
+            }
+        }
+        info!(
+            sl!(),
+            "hotunplug_network_device(): successfully removed {}", frontend_id
+        );
+        Ok(())
+    }
+
     pub fn get_device_by_qdev_id(&mut self, qdev_id: &str) -> Result<PciPath> {
         let format_str = |vec: &Vec<i64>| -> String {
             vec.iter()
@@ -1245,6 +1291,7 @@ impl Qmp {
         physical_block_size: u32,
         vmdk: Option<&VmdkConfig>,
         iothread: Option<&str>,
+        io_limits: Option<&BlockIoLimits>,
     ) -> Result<(Option<PciPath>, Option<String>)> {
         // `blockdev-add`
         let node_name = block_node_name(index);
@@ -1421,6 +1468,7 @@ impl Qmp {
                 "scsi-hd",
                 blkdev_add_args,
             )?;
+            self.set_block_io_limits(&node_name, io_limits)?;
 
             info!(
                 sl!(),
@@ -1479,6 +1527,12 @@ impl Qmp {
                 }
                 return Err(e);
             }
+            if let Err(e) = self.set_block_io_limits(&node_name, io_limits) {
+                if let Some(ref mut sub) = self.ccw_subchannel {
+                    let _ = sub.remove_device(&node_name);
+                }
+                return Err(e);
+            }
 
             info!(
                 sl!(),
@@ -1531,6 +1585,7 @@ impl Qmp {
                 block_driver,
                 blkdev_add_args,
             )?;
+            self.set_block_io_limits(&node_name, io_limits)?;
 
             let pci_path = self
                 .get_device_by_qdev_id(&node_name)
@@ -1542,6 +1597,52 @@ impl Qmp {
             );
 
             Ok((Some(pci_path), None))
+        }
+    }
+
+    /// Gives a block device its own limits (openstack-nova-kata ADR-051) as
+    /// libvirt gives a disk its <iotune>: block_set_io_throttle on the device,
+    /// in a throttle group of its own, right after device_add. The node graph
+    /// stays as it is (the raw node that growth resizes remains the device's
+    /// root). The group belongs to the device's block backend and goes with
+    /// device_del. If the limits cannot be set the device is removed again
+    /// and the attachment fails: it never stays without its limits.
+    fn set_block_io_limits(
+        &mut self,
+        node_name: &str,
+        io_limits: Option<&BlockIoLimits>,
+    ) -> Result<()> {
+        let Some(limits) = io_limits else {
+            return Ok(());
+        };
+        let throttle = block_io_throttle(node_name, limits);
+        info!(sl!(), "set_block_io_limits(): {:?}", throttle);
+        let error = match self.qmp.execute(&qmp::block_set_io_throttle(throttle)) {
+            Ok(_) => return Ok(()),
+            Err(e) => anyhow!("volume_qos: block_set_io_throttle for {}: {:?}", node_name, e),
+        };
+        let rollback = (|| -> Result<()> {
+            self.qmp
+                .execute(&qmp::device_del {
+                    id: node_name.to_owned(),
+                })
+                .map_err(|e| anyhow!("device_del: {:?}", e))?;
+            self.wait_for_device_deleted(node_name, DEVICE_DELETED_TIMEOUT)?;
+            self.qmp
+                .execute(&qapi_qmp::blockdev_del {
+                    node_name: node_name.to_owned(),
+                })
+                .map_err(|e| anyhow!("blockdev_del: {:?}", e))?;
+            self.remove_block_fdsets(node_name);
+            Ok(())
+        })();
+        match rollback {
+            Ok(()) => Err(error),
+            // The node keeps its fdsets, so its name is not reused, and the
+            // error says the device is still in the VM.
+            Err(rollback) => Err(error.context(format!(
+                "volume_qos: device {node_name} without its limits could not be removed: {rollback:?}"
+            ))),
         }
     }
 
@@ -1834,6 +1935,103 @@ pub fn get_qmp_socket_path(sid: &str) -> String {
     }
 }
 
+/// QMP block_set_io_throttle of a device's limits, with libvirt's mapping of
+/// its <iotune> keys (qemuMonitorJSONSetBlockIoThrottle). A key that is
+/// absent is 0 (no limit) or left out.
+#[allow(deprecated)]
+fn block_io_throttle(qdev_id: &str, limits: &BlockIoLimits) -> qmp::BlockIOThrottle {
+    // Values are at most 10^15 (BlockIoLimits), so they fit an i64.
+    let value = |v: Option<u64>| v.map(|v| v as i64);
+    qmp::BlockIOThrottle {
+        device: None,
+        id: Some(qdev_id.to_owned()),
+        group: Some(format!("nova-qos-{qdev_id}")),
+        bps: value(limits.total_bytes_sec).unwrap_or(0),
+        bps_rd: value(limits.read_bytes_sec).unwrap_or(0),
+        bps_wr: value(limits.write_bytes_sec).unwrap_or(0),
+        iops: value(limits.total_iops_sec).unwrap_or(0),
+        iops_rd: value(limits.read_iops_sec).unwrap_or(0),
+        iops_wr: value(limits.write_iops_sec).unwrap_or(0),
+        bps_max: value(limits.total_bytes_sec_max),
+        bps_rd_max: value(limits.read_bytes_sec_max),
+        bps_wr_max: value(limits.write_bytes_sec_max),
+        iops_max: value(limits.total_iops_sec_max),
+        iops_rd_max: value(limits.read_iops_sec_max),
+        iops_wr_max: value(limits.write_iops_sec_max),
+        iops_size: value(limits.size_iops_sec),
+        bps_max_length: None,
+        bps_rd_max_length: None,
+        bps_wr_max_length: None,
+        iops_max_length: None,
+        iops_rd_max_length: None,
+        iops_wr_max_length: None,
+    }
+}
+
+#[cfg(test)]
+mod nova_volume_qos_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn limits(pairs: &[(&str, &str)]) -> BlockIoLimits {
+        let metadata: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (format!("{}{k}", crate::VOLUME_QOS_PREFIX), v.to_string()))
+            .collect();
+        BlockIoLimits::from_volume_metadata(&metadata).unwrap().unwrap()
+    }
+
+    #[test]
+    fn nova_volume_qos_qmp_all_keys() {
+        let throttle = block_io_throttle(
+            "drive-3",
+            &limits(&[
+                ("read_bytes_sec", "1000"),
+                ("write_bytes_sec", "2000"),
+                ("read_iops_sec", "10"),
+                ("write_iops_sec", "20"),
+                ("read_bytes_sec_max", "3000"),
+                ("write_bytes_sec_max", "4000"),
+                ("read_iops_sec_max", "30"),
+                ("write_iops_sec_max", "40"),
+                ("size_iops_sec", "4096"),
+            ]),
+        );
+        assert_eq!(
+            serde_json::to_value(&throttle).unwrap(),
+            serde_json::json!({
+                "id": "drive-3", "group": "nova-qos-drive-3",
+                "bps": 0, "bps_rd": 1000, "bps_wr": 2000,
+                "iops": 0, "iops_rd": 10, "iops_wr": 20,
+                "bps_rd_max": 3000, "bps_wr_max": 4000,
+                "iops_rd_max": 30, "iops_wr_max": 40, "iops_size": 4096
+            })
+        );
+    }
+
+    #[test]
+    fn nova_volume_qos_qmp_totals() {
+        let throttle = block_io_throttle(
+            "drive-1",
+            &limits(&[
+                ("total_bytes_sec", "1048576"),
+                ("total_bytes_sec_max", "2097152"),
+                ("total_iops_sec", "100"),
+                ("total_iops_sec_max", "200"),
+            ]),
+        );
+        assert_eq!(
+            serde_json::to_value(&throttle).unwrap(),
+            serde_json::json!({
+                "id": "drive-1", "group": "nova-qos-drive-1",
+                "bps": 1048576, "bps_rd": 0, "bps_wr": 0,
+                "iops": 100, "iops_rd": 0, "iops_wr": 0,
+                "bps_max": 2097152, "iops_max": 200
+            })
+        );
+    }
+}
+
 /// Generate a blockdev node name based on the given index.
 fn block_node_name(index: u64) -> String {
     format!("drive-{index}")
@@ -1879,5 +2077,164 @@ mod tests {
             collect_block_fdsets(fdsets),
             HashMap::from([("drive-2".to_string(), vec![7, 8])])
         );
+    }
+}
+
+// SPDX-License-Identifier: Apache-2.0
+// Candidate included inside qemu::qmp; callers must hold native device ownership.
+
+fn validate_block_growth(current: i64, host_bytes: u64, requested: u64) -> Result<i64> {
+    let requested = i64::try_from(requested).context("block growth exceeds QMP size range")?;
+    if current <= 0 || requested <= 0 || requested % 512 != 0 {
+        return Err(anyhow!("block growth requires positive sector-aligned capacity"));
+    }
+    if requested < current {
+        return Err(anyhow!("block shrink is unsupported"));
+    }
+    // QMP must refresh an already-grown backend, never resize storage on behalf
+    // of Cinder. Exact agreement also refuses a stale, smaller concurrent event.
+    if host_bytes != requested as u64 {
+        return Err(anyhow!("host capacity differs from requested block growth"));
+    }
+    Ok(requested)
+}
+
+/// Kata passes raw block sources to QEMU by file descriptor, so the node's file
+/// is "/dev/fdset/<id>" rather than the host device path.
+fn growth_fdset_id(file: &str) -> Result<i64> {
+    let id = file.strip_prefix("/dev/fdset/")
+        .ok_or_else(|| anyhow!("block growth node is not backed by a shim-passed descriptor"))?;
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(anyhow!("block growth node has an invalid fdset path"));
+    }
+    id.parse().context("block growth fdset id")
+}
+
+/// The fdset must hold exactly the one descriptor the shim registered as this
+/// node's raw block source; returns that descriptor's number inside QEMU.
+fn growth_source_fd(fdsets: &[(i64, Vec<(i64, Option<String>)>)], node_name: &str,
+                    fdset_id: i64) -> Result<i64> {
+    let expected = block_fd_opaque(node_name, "block-source");
+    let mut matching = fdsets.iter().filter(|(id, _)| *id == fdset_id);
+    let (_, fds) = matching.next().ok_or_else(|| anyhow!("block growth fdset is absent"))?;
+    if matching.next().is_some() {
+        return Err(anyhow!("block growth fdset id is ambiguous"));
+    }
+    match fds.as_slice() {
+        [(fd, Some(opaque))] if *opaque == expected && *fd >= 0 => Ok(*fd),
+        _ => Err(anyhow!("block growth fdset is not this node's raw block source")),
+    }
+}
+
+impl Qmp {
+    fn owned_raw_block_capacity(&mut self, index: u64, qemu_pid: u32, major: i64,
+                                minor: i64) -> Result<i64> {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let name = block_node_name(index);
+        let nodes = self.qmp.execute(&qmp::query_named_block_nodes { flat: Some(true) })?;
+        let mut owned = nodes.into_iter().filter(|node| node.node_name.as_deref() == Some(&name));
+        let node = owned.next().context("block growth node is absent")?;
+        if owned.next().is_some() || node.drv != "raw" || node.ro || node.encrypted
+            || node.backing_file.is_some() || node.backing_file_depth != 0
+            || node.image.base.filename != node.file {
+            return Err(anyhow!("block growth requires a unique writable raw node without backing chain"));
+        }
+        let fdset_id = growth_fdset_id(&node.file)?;
+        // Both the live QMP state and the shim's own registration must name
+        // this fdset for this node.
+        if self.block_fdsets.get(&name).map(Vec::as_slice) != Some(&[fdset_id][..]) {
+            return Err(anyhow!("block growth fdset is not registered for this node"));
+        }
+        let fdsets: Vec<(i64, Vec<(i64, Option<String>)>)> = self.qmp
+            .execute(&qmp::query_fdsets {})
+            .context("query QEMU fdsets for block growth")?
+            .into_iter()
+            .map(|set| (set.fdset_id, set.fds.into_iter().map(|fd| (fd.fd, fd.opaque)).collect()))
+            .collect();
+        let fd = growth_source_fd(&fdsets, &name, fdset_id)?;
+        // The descriptor QEMU actually holds must be the owned host device.
+        let held = std::fs::metadata(format!("/proc/{qemu_pid}/fd/{fd}"))
+            .context("inspect QEMU block growth descriptor")?;
+        if !held.file_type().is_block_device()
+            || libc::major(held.rdev()) as i64 != major
+            || libc::minor(held.rdev()) as i64 != minor {
+            return Err(anyhow!("QEMU block growth descriptor is not the owned host device"));
+        }
+        Ok(node.image.base.virtual_size)
+    }
+
+    /// Refresh capacity of an existing native raw block device after backend
+    /// growth. The caller must obtain host_bytes and the device number from the
+    /// exact owned mapping under the same attachment lock; an arbitrary path or
+    /// tenant size is not ownership evidence. This method does not grow
+    /// filesystems or Cinder RBD.
+    pub fn grow_block_device(&mut self, index: u64, qemu_pid: u32, major: i64, minor: i64,
+                             host_bytes: u64, requested: u64) -> Result<()> {
+        let current = self.owned_raw_block_capacity(index, qemu_pid, major, minor)?;
+        let size = validate_block_growth(current, host_bytes, requested)?;
+        if current == size {
+            return Ok(());
+        }
+        self.qmp.execute(&qmp::block_resize {
+            device: None, node_name: Some(block_node_name(index)), size,
+        }).context("QMP block growth outcome may be uncertain; retain attachment")?;
+        if self.owned_raw_block_capacity(index, qemu_pid, major, minor)? != size {
+            return Err(anyhow!("QMP block growth capacity not confirmed; retain attachment"));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod nova_block_growth_tests {
+    use super::*;
+
+    #[test]
+    fn growth_and_equal_capacity_replay() {
+        assert_eq!(validate_block_growth(512, 1024, 1024).unwrap(), 1024);
+        assert_eq!(validate_block_growth(1024, 1024, 1024).unwrap(), 1024);
+    }
+
+    #[test]
+    fn refuse_shrink_and_stale_backend_observation() {
+        for (current, host, requested) in [(1024, 1024, 512), (512, 512, 1024),
+                                          (512, 2048, 1024), (2048, 2048, 1024)] {
+            assert!(validate_block_growth(current, host, requested).is_err());
+        }
+    }
+
+    #[test]
+    fn refuse_unknown_unaligned_and_overflow_capacity() {
+        for (current, host, requested) in [(0, 512, 512), (-1, 512, 512),
+            (512, 0, 0), (512, 513, 513), (512, u64::MAX, u64::MAX)] {
+            assert!(validate_block_growth(current, host, requested).is_err());
+        }
+    }
+
+    #[test]
+    fn fdset_path_is_the_only_accepted_node_file() {
+        assert_eq!(growth_fdset_id("/dev/fdset/7").unwrap(), 7);
+        for file in ["/dev/sdc", "/dev/fdset/", "/dev/fdset/-1", "/dev/fdset/7/x",
+                     "/dev/fdset/ 7", "fdset/7"] {
+            assert!(growth_fdset_id(file).is_err(), "{file}");
+        }
+    }
+
+    #[test]
+    fn source_fd_requires_the_nodes_single_block_source() {
+        let own = Some(block_fd_opaque("drive-3", "block-source"));
+        let sets = vec![(7, vec![(41, own.clone())]),
+                        (8, vec![(42, Some(block_fd_opaque("drive-4", "block-source")))])];
+        assert_eq!(growth_source_fd(&sets, "drive-3", 7).unwrap(), 41);
+        // Another node's fdset, a missing set, or a mislabeled descriptor.
+        assert!(growth_source_fd(&sets, "drive-3", 8).is_err());
+        assert!(growth_source_fd(&sets, "drive-3", 9).is_err());
+        for fds in [vec![], vec![(41, None)], vec![(41, own.clone()), (43, own.clone())],
+                    vec![(41, Some(block_fd_opaque("drive-3", "vmdk-extent-0")))],
+                    vec![(-1, own.clone())]] {
+            assert!(growth_source_fd(&[(7, fds.clone())], "drive-3", 7).is_err(), "{fds:?}");
+        }
+        assert!(growth_source_fd(&[(7, vec![(41, own.clone())]), (7, vec![(41, own)])],
+                                 "drive-3", 7).is_err());
     }
 }

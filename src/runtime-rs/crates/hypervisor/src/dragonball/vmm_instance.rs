@@ -271,6 +271,18 @@ impl VmmInstance {
         Ok(None)
     }
 
+    /// Show the guest the new capacity of a block device whose host device
+    /// has grown (openstack-nova-kata ADR-033).
+    pub fn resize_block_device(&self, id: &str, requested: u64) -> Result<()> {
+        info!(sl!(), "resize block device {} to {}", id, requested);
+        self.handle_request(Request::Sync(VmmAction::ResizeBlockDevice(
+            id.to_string(),
+            requested,
+        )))
+        .with_context(|| format!("Failed to resize block device {id}"))?;
+        Ok(())
+    }
+
     pub fn remove_block_device(&self, id: &str, timeout: Duration) -> Result<()> {
         info!(sl!(), "remove block device {}", id);
 
@@ -286,6 +298,43 @@ impl VmmInstance {
 
         self.handle_request(Request::Sync(VmmAction::RemoveBlockDevice(id.to_string())))
             .with_context(|| format!("Failed to remove block device {id:?}"))?;
+        Ok(())
+    }
+
+    /// Nova Kata (ADR-044): the guest is asked to release the device and
+    /// its answer is required; then the device is destroyed, which closes
+    /// the host interface.
+    pub fn remove_network_device(&self, id: &str, timeout: Duration) -> Result<()> {
+        info!(sl!(), "remove network device {}", id);
+
+        let vmmdata = self
+            .handle_request(Request::Sync(VmmAction::PrepareRemoveNetworkDevice(
+                id.to_string(),
+            )))
+            .with_context(|| format!("Failed to prepare remove network device {id:?}"))?;
+
+        if let VmmData::SyncHotplug((_, receiver)) = vmmdata {
+            match receiver.recv_timeout(timeout)? {
+                Some(0) => (),
+                answer => {
+                    return Err(anyhow!(
+                        "network_update_conflict: the guest did not release {}: {:?}",
+                        id,
+                        answer
+                    ))
+                }
+            }
+        } else {
+            return Err(anyhow!(
+                "network_update_conflict: the guest was not asked to release {}",
+                id
+            ));
+        }
+
+        self.handle_request(Request::Sync(VmmAction::RemoveNetworkDevice(
+            id.to_string(),
+        )))
+        .with_context(|| format!("Failed to remove network device {id:?}"))?;
         Ok(())
     }
 

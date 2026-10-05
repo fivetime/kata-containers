@@ -578,6 +578,18 @@ impl AgentService {
                 Ok(()) => (),
             }
         } else {
+            // The experimental Nova owner uses kernel subtree kill rather
+            // than parent-only PID enumeration. It also fences future attach.
+            let killed = {
+                let mut sandbox = self.sandbox.lock().await;
+                let ctr = sandbox
+                    .get_container(&cid)
+                    .ok_or_else(|| anyhow!("Invalid container id {}", cid))?;
+                ctr.cgroup_manager.as_ref().kill_all()?
+            };
+            if killed {
+                return Ok(());
+            }
             // Signalling all processes in the cgroup
             info!(
                 sl(),
@@ -941,6 +953,78 @@ fn mem_agent_compactconfig_to_compact_optionconfig(
 
 #[async_trait]
 impl agent_ttrpc::AgentService for AgentService {
+    async fn attach_block_device(
+        &self,
+        ctx: &TtrpcContext,
+        req: protocols::agent::AttachBlockDeviceRequest,
+    ) -> ttrpc::Result<Empty> {
+        trace_rpc_call!(ctx, "attach_block_device", req);
+        is_allowed(&req).await?;
+        if !rustjail::cgroups_rs::hierarchies::is_cgroup2_unified_mode() {
+            return Err(ttrpc_error(ttrpc::Code::UNIMPLEMENTED,
+                "live block attach candidate requires unified guest cgroups"));
+        }
+        if req.request_id.is_empty() || req.request_id.len() > 128 {
+            return Err(ttrpc_error(ttrpc::Code::INVALID_ARGUMENT, "invalid request ID"));
+        }
+        let device = req.device.as_ref().ok_or_else(||
+            ttrpc_error(ttrpc::Code::INVALID_ARGUMENT, "block device required"))?;
+        let name = device.container_path.strip_prefix("/dev/")
+            .filter(|name| !name.is_empty() && *name != "." && *name != ".."
+                && !name.contains('/') && !name.contains('\0'))
+            .ok_or_else(|| ttrpc_error(ttrpc::Code::INVALID_ARGUMENT, "invalid device path"))?;
+        let original_directory = {
+            let mut sandbox = self.sandbox.lock().await;
+            sandbox.get_container(&req.container_id)
+                .map_ttrpc_err(ttrpc::Code::NOT_FOUND, "container not found")?
+                .live_device_directory(&req.request_id).map_ttrpc_err(same)?
+        };
+        // Device discovery can wait for uevents; never hold the sandbox mutex
+        // across it. The original directory handle fences container replacement.
+        let (major, minor) = crate::device::resolve_live_block_device(device, &self.sandbox)
+            .await.map_ttrpc_err(same)?;
+        let signature = serde_json::to_string(&req)
+            .map_err(|error| ttrpc_error(ttrpc::Code::INTERNAL, error))?;
+        let mut sandbox = self.sandbox.lock().await;
+        let container = sandbox.get_container(&req.container_id)
+            .map_ttrpc_err(ttrpc::Code::NOT_FOUND, "container not found")?;
+        container.attach_live_block_device(&original_directory, &req.request_id,
+            &signature, name, major, minor).map_ttrpc_err(same)?;
+        Ok(Empty::new())
+    }
+
+    async fn detach_block_device(
+        &self,
+        ctx: &TtrpcContext,
+        req: protocols::agent::DetachBlockDeviceRequest,
+    ) -> ttrpc::Result<Empty> {
+        trace_rpc_call!(ctx, "detach_block_device", req);
+        is_allowed(&req).await?;
+        if req.request_id.is_empty() || req.request_id.len() > 128
+            || req.attach_request_id.is_empty() || req.attach_request_id.len() > 128 {
+            return Err(ttrpc_error(ttrpc::Code::INVALID_ARGUMENT, "invalid detach identity"));
+        }
+        // Keep the sandbox lock through freeze confirmation, occupancy checking
+        // and node withdrawal. The normal resume RPC uses this same lock.
+        let mut sandbox = self.sandbox.lock().await;
+        let container = sandbox.get_container(&req.container_id)
+            .map_ttrpc_err(ttrpc::Code::NOT_FOUND, "container not found")?;
+        container.detach_live_block_device(&req.attach_request_id, &req.request_id,
+            &req.phase).map_err(|error| {
+                use rustjail::live_block_device::DetachAdmission;
+                match error.downcast_ref::<DetachAdmission>() {
+                    // ttrpc_error uses Debug formatting and would quote these
+                    // stable wire tokens. Construct the exact status directly.
+                    Some(DetachAdmission::Busy) => ttrpc::Error::RpcStatus(ttrpc::get_status(
+                        ttrpc::Code::FAILED_PRECONDITION, "block_detach_busy")),
+                    Some(DetachAdmission::FreezePending) => ttrpc::Error::RpcStatus(ttrpc::get_status(
+                        ttrpc::Code::UNAVAILABLE, "block_detach_freeze_pending")),
+                    None => ttrpc_error(ttrpc::Code::INTERNAL, error),
+                }
+            })?;
+        Ok(Empty::new())
+    }
+
     async fn create_container(
         &self,
         ctx: &TtrpcContext,
@@ -2061,6 +2145,12 @@ fn get_agent_details() -> AgentDetails {
     detail.device_handlers = Vec::new();
     detail.storage_handlers = STORAGE_HANDLERS.get_handlers();
     detail.extra_features = get_build_features();
+    if rustjail::cgroups_rs::hierarchies::is_cgroup2_unified_mode() {
+        detail.extra_features.push("block-device-attach-v1".into());
+        detail.extra_features.push("block-device-detach-v1".into());
+        detail.extra_features.push("block-device-created-v1".into());
+        detail.extra_features.push("block-device-verify-paused-v1".into());
+    }
 
     detail
 }

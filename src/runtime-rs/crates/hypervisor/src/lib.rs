@@ -154,6 +154,23 @@ pub trait Hypervisor: std::fmt::Debug + Send + Sync {
     async fn add_device(&self, device: DeviceType) -> Result<DeviceType>;
     async fn remove_device(&self, device: DeviceType) -> Result<()>;
     async fn update_device(&self, device: DeviceType) -> Result<()>;
+    /// Nova Kata (ADR-044): whether remove_network_device takes a virtio-net
+    /// device from the running guest. remove_device never does: it is the
+    /// teardown of a sandbox that stops.
+    fn supports_network_removal(&self) -> bool {
+        false
+    }
+    /// Take the virtio-net device from the running guest and release its
+    /// host interface. It returns once the VMM holds the interface no more.
+    async fn remove_network_device(&self, _device: NetworkDevice) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "network_update_unsupported: this hypervisor removes no network device"
+        ))
+    }
+    fn supports_block_growth(&self) -> bool { false }
+    async fn grow_block_device(&self, _device: DeviceType, _requested: u64) -> Result<()> {
+        Err(anyhow::anyhow!("block growth unsupported by this hypervisor"))
+    }
 
     // utils
     async fn get_agent_socket(&self) -> Result<String>;

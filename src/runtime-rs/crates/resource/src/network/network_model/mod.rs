@@ -30,6 +30,12 @@ pub trait NetworkModel: std::fmt::Debug + Send + Sync {
     fn model_type(&self) -> NetworkModelType;
     async fn add(&self, net_pair: &NetworkPair) -> Result<()>;
     async fn del(&self, net_pair: &NetworkPair) -> Result<()>;
+    /// Nova Kata (ADR-044): disconnect the two interfaces and keep both.
+    async fn release(&self, _net_pair: &NetworkPair) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "network_update_unsupported: this network model releases no interface"
+        ))
+    }
 }
 
 pub fn new(model: &str) -> Result<Arc<dyn NetworkModel>> {

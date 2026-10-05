@@ -672,3 +672,31 @@ mod test {
         assert!(kernel_modules[1].parameters.is_empty());
     }
 }
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct AttachBlockDeviceRequest {
+    pub container_id: String,
+    pub request_id: String,
+    pub device: Device,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct DetachBlockDeviceRequest {
+    pub container_id: String,
+    pub request_id: String,
+    pub attach_request_id: String,
+    pub phase: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum BlockDetachRefusal { Busy, FreezePending }
+
+pub fn block_detach_refusal(error: &anyhow::Error) -> Option<BlockDetachRefusal> {
+    match error.downcast_ref::<ttrpc::Error>() {
+        Some(ttrpc::Error::RpcStatus(status)) if status.code() == ttrpc::Code::FAILED_PRECONDITION
+            && status.message == "block_detach_busy" => Some(BlockDetachRefusal::Busy),
+        Some(ttrpc::Error::RpcStatus(status)) if status.code() == ttrpc::Code::UNAVAILABLE
+            && status.message == "block_detach_freeze_pending" => Some(BlockDetachRefusal::FreezePending),
+        _ => None,
+    }
+}

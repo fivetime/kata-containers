@@ -15,6 +15,10 @@ use super::{
     utils::{self, address::Address, link},
 };
 
+#[cfg(test)]
+#[path = "native_network_tests.rs"]
+mod native_network_tests;
+
 const TAP_SUFFIX: &str = "_kata";
 
 #[derive(Default, Debug, Clone)]
@@ -141,6 +145,13 @@ impl NetworkPair {
     pub(crate) async fn add_network_model(&self) -> Result<()> {
         let model = self.model.clone();
         model.add(self).await.context("add")?;
+        Ok(())
+    }
+
+    /// Nova Kata (ADR-044): as del_network_model, but the TAP stays.
+    pub(crate) async fn release_network_model(&self) -> Result<()> {
+        let model = self.model.clone();
+        model.release(self).await.context("release")?;
         Ok(())
     }
 

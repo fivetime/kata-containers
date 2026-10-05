@@ -108,6 +108,10 @@ pub enum BlockDeviceError {
     #[error("could not send patch message to the block epoll handler")]
     BlockEpollHanderSendFail,
 
+    /// The block device did not take a new capacity (openstack-nova-kata).
+    #[error("block device resize failed: {0}")]
+    ResizeFailed(String),
+
     /// Failure from device manager,
     #[error("device manager errors: {0}")]
     DeviceManager(#[from] DeviceMgrError),
@@ -937,6 +941,51 @@ impl BlockDeviceMgr {
         }
 
         Err(BlockDeviceError::InvalidDeviceId("".to_owned()))
+    }
+
+    /// Show the guest the new capacity of a writable block device whose host
+    /// device has grown (openstack-nova-kata ADR-033).
+    pub fn resize_device(
+        &mut self,
+        drive_id: &str,
+        requested: u64,
+    ) -> std::result::Result<u64, BlockDeviceError> {
+        let index = self
+            .get_index_of_drive_id(drive_id)
+            .ok_or_else(|| BlockDeviceError::InvalidDeviceId(drive_id.to_owned()))?;
+        if self.info_list[index].config.is_read_only {
+            return Err(BlockDeviceError::ResizeFailed(
+                "a read-only device is not resized".to_owned(),
+            ));
+        }
+        let device = self.info_list[index]
+            .device
+            .as_ref()
+            .ok_or_else(|| BlockDeviceError::InvalidDeviceId(drive_id.to_owned()))?;
+        let resize = |inner: &mut dyn std::any::Any| {
+            inner
+                .downcast_mut::<virtio::block::Block<GuestAddressSpaceImpl>>()
+                .ok_or_else(|| {
+                    BlockDeviceError::ResizeFailed("not a virtio-blk device".to_owned())
+                })?
+                .resize(requested)
+                .map_err(|e| BlockDeviceError::ResizeFailed(e.to_string()))
+        };
+        if let Some(mmio_dev) = device.as_any().downcast_ref::<DbsMmioV2Device>() {
+            let mut guard = mmio_dev.state();
+            return resize(guard.get_inner_device_mut().as_any_mut());
+        }
+        if let Some(pci_dev) = device.as_any().downcast_ref::<VirtioPciDevice<
+            GuestAddressSpaceImpl,
+            QueueSync,
+            GuestRegionMmap,
+        >>() {
+            let mut inner = pci_dev.device();
+            return resize(inner.as_any_mut());
+        }
+        Err(BlockDeviceError::ResizeFailed(
+            "the device's transport is not known".to_owned(),
+        ))
     }
 
     /// Update the ratelimiter settings of a virtio blk device.

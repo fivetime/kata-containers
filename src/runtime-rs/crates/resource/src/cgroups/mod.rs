@@ -5,6 +5,7 @@
 //
 
 pub mod cgroup_persist;
+mod cgroup_return;
 mod resource;
 pub use resource::CgroupsResource;
 mod resource_inner;

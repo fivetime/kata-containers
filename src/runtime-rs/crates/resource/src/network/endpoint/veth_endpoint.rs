@@ -66,6 +66,39 @@ impl VethEndpoint {
 
 #[async_trait]
 impl Endpoint for VethEndpoint {
+    async fn host_interface(&self) -> Option<String> {
+        Some(self.net_pair.tap.tap_iface.name.clone())
+    }
+
+    async fn hot_detach(&self, keep: bool) -> Result<()> {
+        // The guest first: a device whose host interface is gone is a
+        // device the guest still has.
+        self.d
+            .write()
+            .await
+            .remove_network_device(&self.net_pair.tap.tap_iface.name)
+            .await
+            .context("remove network device of the running guest")?;
+        if keep {
+            self.net_pair
+                .release_network_model()
+                .await
+                .context("release network model")
+        } else {
+            self.net_pair
+                .del_network_model()
+                .await
+                .context("del network model")
+        }
+    }
+
+    async fn discard(&self) -> Result<()> {
+        self.net_pair
+            .del_network_model()
+            .await
+            .context("del network model")
+    }
+
     async fn name(&self) -> String {
         self.net_pair.virt_iface.name.clone()
     }

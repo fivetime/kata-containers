@@ -37,6 +37,71 @@ const DEFAULT_VIRTIO_FS_QUEUE_SIZE: i32 = 1024;
 const VIRTIO_FS: &str = "virtio-fs";
 const INLINE_VIRTIO_FS: &str = "inline-virtio-fs";
 
+/// The rate limiter of a disk with limits of its own (openstack-nova-kata
+/// ADR-051). A bucket of size 0 limits nothing, as for the sandbox's.
+fn dragonball_rate_limiter(limits: &crate::BlockIoLimits) -> Result<RateLimiterConfigInfo> {
+    let config = limits.rate_limiter("dragonball")?;
+    let bucket = |size: u64, burst: Option<u64>, refill_time: u64| TokenBucketConfigInfo {
+        size,
+        one_time_burst: burst.unwrap_or(0),
+        refill_time,
+    };
+    Ok(RateLimiterConfigInfo {
+        bandwidth: config
+            .bandwidth
+            .map(|b| bucket(b.size, b.one_time_burst, b.refill_time))
+            .unwrap_or_default(),
+        ops: config
+            .ops
+            .map(|b| bucket(b.size, b.one_time_burst, b.refill_time))
+            .unwrap_or_default(),
+    })
+}
+
+#[cfg(test)]
+mod nova_volume_qos_tests {
+    use super::*;
+    use crate::BlockIoLimits;
+
+    #[test]
+    fn nova_volume_qos_dragonball_rate_limiter() {
+        let limits = BlockIoLimits {
+            total_bytes_sec: Some(10485760),
+            total_iops_sec: Some(500),
+            ..Default::default()
+        };
+        assert_eq!(
+            dragonball_rate_limiter(&limits).unwrap(),
+            RateLimiterConfigInfo {
+                bandwidth: TokenBucketConfigInfo {
+                    size: 10485760,
+                    one_time_burst: 0,
+                    refill_time: DEFAULT_RATE_LIMITER_REFILL_TIME,
+                },
+                ops: TokenBucketConfigInfo {
+                    size: 500,
+                    one_time_burst: 0,
+                    refill_time: DEFAULT_RATE_LIMITER_REFILL_TIME,
+                },
+            }
+        );
+        // Bytes only: the operations bucket limits nothing.
+        let bytes = BlockIoLimits { total_bytes_sec: Some(4096), ..Default::default() };
+        let config = dragonball_rate_limiter(&bytes).unwrap();
+        assert_eq!(config.ops, TokenBucketConfigInfo::default());
+        assert_eq!(config.bandwidth.size, 4096);
+        for limits in [
+            BlockIoLimits { read_bytes_sec: Some(1), ..Default::default() },
+            BlockIoLimits { write_iops_sec: Some(1), ..Default::default() },
+            BlockIoLimits { total_iops_sec: Some(1), size_iops_sec: Some(4096), ..Default::default() },
+            BlockIoLimits { total_bytes_sec: Some(1), total_bytes_sec_max: Some(2), ..Default::default() },
+        ] {
+            let error = dragonball_rate_limiter(&limits).unwrap_err().to_string();
+            assert!(error.starts_with("volume_qos_unsupported: dragonball cannot keep"), "{}", error);
+        }
+    }
+}
+
 impl DragonballInner {
     pub(crate) async fn add_device(&mut self, device: DeviceType) -> Result<DeviceType> {
         if self.state == VmmState::NotReady {
@@ -71,6 +136,7 @@ impl DragonballInner {
                     is_direct,
                     driver_option,
                     sparse,
+                    io_limits,
                 ) = {
                     let dev = block_device.lock().await;
                     let cfg = &dev.config;
@@ -82,8 +148,15 @@ impl DragonballInner {
                         cfg.is_direct,
                         cfg.driver_option.clone(),
                         cfg.discard_unmap,
+                        cfg.io_limits,
                     )
                 };
+                // Refused before the device reaches the VMM (ADR-051).
+                let rate_limiter = io_limits
+                    .as_ref()
+                    .map(dragonball_rate_limiter)
+                    .transpose()
+                    .context("add block modern device")?;
 
                 let use_pci_bus = if driver_option == KATA_BLK_DEV_TYPE {
                     Some(true)
@@ -109,6 +182,7 @@ impl DragonballInner {
                         is_direct,
                         use_pci_bus,
                         sparse,
+                        rate_limiter,
                     )
                     .context("add block modern device")?;
 
@@ -137,6 +211,7 @@ impl DragonballInner {
                     None,
                     None,
                     false,
+                    None,
                 )
                 .context("add vhost user based block device")?;
                 Ok(DeviceType::VhostUserBlk(block))
@@ -268,6 +343,7 @@ impl DragonballInner {
         is_direct: Option<bool>,
         use_pci_bus: Option<bool>,
         sparse: bool,
+        rate_limiter: Option<RateLimiterConfigInfo>,
     ) -> Result<Option<i32>> {
         let jailed_drive = self.get_resource(path, id).context("get resource")?;
         self.cached_block_devices.insert(id.to_string());
@@ -302,7 +378,7 @@ impl DragonballInner {
             is_read_only: read_only,
             use_pci_bus,
             sparse,
-            rate_limiter: Some(block_rate_limit),
+            rate_limiter: Some(rate_limiter.unwrap_or(block_rate_limit)),
             ..Default::default()
         };
         info!(
@@ -339,6 +415,61 @@ impl DragonballInner {
             self.cached_block_devices.remove(id);
         }
         Ok(())
+    }
+
+    // Nova Kata (ADR-044): the device is known by the name of the interface
+    // it was inserted with.
+    /// Show the guest the new size of a raw block device whose host device
+    /// Cinder grew (openstack-nova-kata ADR-033). The size must be the host
+    /// device's own, read from the device the guest uses; the storage is
+    /// never resized here.
+    pub(crate) async fn grow_block_device(
+        &mut self,
+        device: DeviceType,
+        requested: u64,
+    ) -> Result<()> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+        let DeviceType::BlockModern(shared) = device else {
+            return Err(anyhow!("block growth unsupported for this device type"));
+        };
+        let device = shared.lock().await;
+        validate_growth_device(&device)?;
+        let source = &device.config.path_on_host;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(source)?;
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_block_device()
+            || libc::major(metadata.rdev()) as i64 != device.config.major
+            || libc::minor(metadata.rdev()) as i64 != device.config.minor
+        {
+            return Err(anyhow!("block growth host device identity changed"));
+        }
+        let mut host_bytes = 0_u64;
+        unsafe { growth_block_size(file.as_raw_fd(), &mut host_bytes) }
+            .context("read owned host block capacity")?;
+        validate_growth_size(host_bytes, requested)?;
+        self.vmm_instance
+            .resize_block_device(&device.device_id, requested)
+            .context("dragonball block growth outcome may be uncertain; retain attachment")
+    }
+
+    pub(crate) async fn remove_network_device(
+        &mut self,
+        device: crate::NetworkDevice,
+    ) -> Result<()> {
+        info!(
+            sl!(),
+            "dragonball remove network device {}", device.config.virt_iface_name
+        );
+        self.vmm_instance
+            .remove_network_device(
+                &device.config.virt_iface_name,
+                Duration::from_millis(DEFAULT_HOTPLUG_TIMEOUT),
+            )
+            .context("remove network device")
     }
 
     fn add_net_device(&mut self, config: &NetworkConfig) -> Result<()> {
@@ -452,25 +583,7 @@ impl DragonballInner {
     }
 
     fn add_share_fs_device(&self, config: &ShareFsConfig) -> Result<()> {
-        let mut fs_cfg = FsDeviceConfigInfo {
-            sock_path: config.sock_path.clone(),
-            tag: config.mount_tag.clone(),
-            num_queues: if config.queue_num > 0 {
-                config.queue_num as usize
-            } else {
-                DEFAULT_VIRTIO_FS_NUM_QUEUES as usize
-            },
-            queue_size: if config.queue_size > 0 {
-                config.queue_size as u16
-            } else {
-                DEFAULT_VIRTIO_FS_QUEUE_SIZE as u16
-            },
-            cache_size: (self.config.shared_fs.virtio_fs_cache_size as u64)
-                .saturating_mul(MB_TO_B as u64),
-            xattr: true,
-            ..Default::default()
-        };
-
+        let mut fs_cfg = share_fs_device_config(config, self.config.shared_fs.virtio_fs_cache_size);
         let mut options = config.options.clone();
         self.do_add_fs_device(&config.fs_type, &mut fs_cfg, &mut options)
     }
@@ -572,5 +685,138 @@ mod tests {
         assert_eq!(fs_cfg.cache_policy, "auto".to_string());
         assert!(fs_cfg.drop_sys_resource);
         assert!(fs_cfg.thread_pool_size == 128);
+    }
+}
+
+// openstack-nova-kata ADR-033: the checks of a growth under Dragonball.
+nix::ioctl_read!(growth_block_size, 0x12, 114, u64);
+
+fn validate_growth_device(device: &crate::BlockDeviceModern) -> Result<()> {
+    if device.device_id.is_empty()
+        || device.attach_count != 1
+        || device.config.is_readonly
+        || device.config.vmdk.is_some()
+        || device.config.major < 0
+        || device.config.minor < 0
+    {
+        return Err(anyhow!(
+            "block growth requires one attached writable raw device with known identity"
+        ));
+    }
+    Ok(())
+}
+
+/// The VMM is shown the host device's size, which Cinder made: a stale or
+/// unaligned request is refused before the VMM is asked.
+fn validate_growth_size(host_bytes: u64, requested: u64) -> Result<()> {
+    if requested == 0 || requested % 512 != 0 {
+        return Err(anyhow!("block growth requires positive sector-aligned capacity"));
+    }
+    if host_bytes != requested {
+        return Err(anyhow!("host capacity differs from requested block growth"));
+    }
+    Ok(())
+}
+
+/// The Dragonball configuration of a share-fs device. A `virtio-fs` device
+/// is served by an external virtiofsd over vhost-user (Nova shares,
+/// ADR-045), which maps no DAX window: its cache size stays zero.
+fn share_fs_device_config(config: &ShareFsConfig, cache_size_mb: u32) -> FsDeviceConfigInfo {
+    FsDeviceConfigInfo {
+        sock_path: config.sock_path.clone(),
+        tag: config.mount_tag.clone(),
+        num_queues: if config.queue_num > 0 {
+            config.queue_num as usize
+        } else {
+            DEFAULT_VIRTIO_FS_NUM_QUEUES as usize
+        },
+        queue_size: if config.queue_size > 0 {
+            config.queue_size as u16
+        } else {
+            DEFAULT_VIRTIO_FS_QUEUE_SIZE as u16
+        },
+        cache_size: if config.fs_type == VIRTIO_FS {
+            0
+        } else {
+            (cache_size_mb as u64).saturating_mul(MB_TO_B as u64)
+        },
+        xattr: true,
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod nova_shares_dragonball_tests {
+    use super::*;
+
+    #[test]
+    fn nova_shares_dragonball_vhost_user_fs_config() {
+        let share = ShareFsConfig {
+            host_shared_path: "/srv/share".into(),
+            fs_type: VIRTIO_FS.into(),
+            sock_path: "/run/kata/s/root/virtiofsd-share-0.sock".into(),
+            mount_tag: "share-a".into(),
+            queue_size: 1024,
+            queue_num: 1,
+            ..Default::default()
+        };
+        let cfg = share_fs_device_config(&share, 512);
+        assert_eq!(cfg.tag, "share-a");
+        assert_eq!(cfg.sock_path, "/run/kata/s/root/virtiofsd-share-0.sock");
+        assert_eq!(
+            (cfg.num_queues, cfg.queue_size, cfg.cache_size),
+            (1, 1024, 0)
+        );
+        let inline = ShareFsConfig {
+            fs_type: INLINE_VIRTIO_FS.into(),
+            mount_tag: "kataShared".into(),
+            ..Default::default()
+        };
+        let cfg = share_fs_device_config(&inline, 512);
+        assert_eq!(cfg.cache_size, 512 * MB_TO_B as u64);
+        assert_eq!(cfg.num_queues, DEFAULT_VIRTIO_FS_NUM_QUEUES as usize);
+    }
+}
+
+#[cfg(test)]
+mod nova_block_growth_dragonball_tests {
+    use super::*;
+
+    fn attached() -> crate::BlockDeviceModern {
+        crate::BlockDeviceModern {
+            device_id: "owned".into(),
+            attach_count: 1,
+            config: crate::BlockConfigModern {
+                major: 252,
+                minor: 1,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn nova_block_growth_dragonball_admits_one_writable_raw_device() {
+        assert!(validate_growth_device(&attached()).is_ok());
+        let mut device = attached();
+        device.attach_count = 2;
+        assert!(validate_growth_device(&device).is_err());
+        let mut device = attached();
+        device.config.is_readonly = true;
+        assert!(validate_growth_device(&device).is_err());
+        let mut device = attached();
+        device.device_id.clear();
+        assert!(validate_growth_device(&device).is_err());
+        let mut device = attached();
+        device.config.major = -1;
+        assert!(validate_growth_device(&device).is_err());
+    }
+
+    #[test]
+    fn nova_block_growth_dragonball_takes_the_host_size_only() {
+        assert!(validate_growth_size(2 << 30, 2 << 30).is_ok());
+        assert!(validate_growth_size(2 << 30, 1 << 30).is_err());
+        assert!(validate_growth_size(2 << 30, (2 << 30) + 512).is_err());
+        assert!(validate_growth_size(1000, 1000).is_err());
+        assert!(validate_growth_size(0, 0).is_err());
     }
 }

@@ -20,6 +20,7 @@ use nix::unistd::Pid;
 use oci_spec::runtime::{LinuxCpu, LinuxCpuBuilder, LinuxResources, LinuxResourcesBuilder};
 use tokio::time::sleep;
 
+use crate::cgroups::cgroup_return::CgroupReturn;
 use crate::cgroups::utils::get_tgid_from_pid;
 use crate::cgroups::CgroupConfig;
 use crate::ResourceUpdateOp;
@@ -31,6 +32,7 @@ pub(crate) struct CgroupsResourceInner {
     resources: HashMap<String, LinuxResources>,
     sandbox_cgroup: CgroupManager,
     overhead_cgroup: Option<CgroupManager>,
+    original_cgroup: Option<CgroupReturn>,
     /// User-facing config knob: whether vCPU pinning is allowed at all.
     /// Comes from TOML `enable_vcpus_pinning` or the per-pod annotation.
     enable_vcpus_pinning: bool,
@@ -150,6 +152,14 @@ impl CgroupsResourceInner {
         let (mut sandbox_cgroup, mut overhead_cgroup) =
             Self::new_cgroup_managers(config).context("create new cgroups")?;
 
+        // Retain this process's original v2 service leaf BEFORE placement.
+        // Do not persist this descriptor or recreate it during restore.
+        let original_cgroup = if sandbox_cgroup.v2() {
+            Some(CgroupReturn::capture().context("capture original shim cgroup")?)
+        } else {
+            None
+        };
+
         // The runtime is prioritized to be added to the overhead cgroup.
         let pid = CgroupPid::from(process::id() as u64);
         if let Some(overhead_cgroup) = overhead_cgroup.as_mut() {
@@ -174,6 +184,7 @@ impl CgroupsResourceInner {
             resources: HashMap::new(),
             sandbox_cgroup,
             overhead_cgroup,
+            original_cgroup,
             enable_vcpus_pinning: config.enable_vcpus_pinning,
             is_vcpus_pinning_on: false,
         })
@@ -187,6 +198,7 @@ impl CgroupsResourceInner {
             resources: HashMap::new(),
             sandbox_cgroup,
             overhead_cgroup,
+            original_cgroup: None,
             enable_vcpus_pinning: config.enable_vcpus_pinning,
             is_vcpus_pinning_on: false,
         })
@@ -438,6 +450,13 @@ impl CgroupsResourceInner {
 
 impl CgroupsResourceInner {
     pub(crate) async fn delete(&mut self) -> Result<()> {
+        // Sandbox stop/wait and helper teardown must precede this call.
+        // Move only this shim through its retained pre-placement descriptor.
+        if let Some(original) = &self.original_cgroup {
+            original
+                .restore_self()
+                .context("return shim to original cgroup")?;
+        }
         self.sandbox_cgroup
             .destroy()
             .context("destroy sandbox cgroup")?;
@@ -567,6 +586,7 @@ mod tests {
             resources: HashMap::new(),
             sandbox_cgroup: Box::new(FsManager::new("test_sandbox_cgroup_pinning").unwrap()),
             overhead_cgroup: None,
+            original_cgroup: None,
             enable_vcpus_pinning: enable_pinning,
             is_vcpus_pinning_on: false,
         }

@@ -2268,3 +2268,26 @@ mod tests {
         );
     }
 }
+
+/// Reuse the existing PCI/SCSI discovery handlers without cold-create spec or
+/// PCI-map mutations. This candidate only accepts bus identities, not vm paths.
+pub async fn resolve_live_block_device(
+    device: &Device, sandbox: &Arc<Mutex<Sandbox>>,
+) -> Result<(u32, u32)> {
+    use std::convert::TryFrom;
+    use kata_types::device::{DRIVER_BLK_PCI_TYPE, DRIVER_SCSI_TYPE};
+    if !matches!(device.type_.as_str(), DRIVER_BLK_PCI_TYPE | DRIVER_SCSI_TYPE)
+        || device.id.is_empty() || !device.vm_path.is_empty() || !device.options.is_empty() {
+        return Err(anyhow!("unsupported live block device descriptor"));
+    }
+    let handler = DEVICE_HANDLERS.handler(&device.type_)
+        .ok_or_else(|| anyhow!("block device handler unavailable"))?;
+    let logger = slog_scope::logger();
+    let mut context = DeviceContext { logger: &logger, sandbox };
+    let resolved = handler.device_handler(device, &mut context).await?;
+    let update = resolved.dev.ok_or_else(|| anyhow!("missing guest block device"))?;
+    if update.info.cgroup_type != "b" || !resolved.pci.is_empty() {
+        return Err(anyhow!("unexpected live block device resolution"));
+    }
+    Ok((u32::try_from(update.info.guest_major)?, u32::try_from(update.info.guest_minor)?))
+}

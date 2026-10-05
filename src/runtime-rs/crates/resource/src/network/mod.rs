@@ -36,8 +36,62 @@ pub enum NetworkConfig {
     Dan(DanNetworkConfig),
 }
 
+/// Nova Kata (ADR-044): an interface of the namespace that joins or leaves
+/// the running guest. Its owner made it and takes it away; the runtime is
+/// told its name and what it must be.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EndpointUpdate {
+    pub port_id: String,
+    pub interface: String,
+    pub mac: String,
+    pub mtu: u32,
+}
+
+impl EndpointUpdate {
+    /// What the host interface of the endpoint is labelled with, for the
+    /// owner of the namespace to read: `pending` while the guest is given
+    /// the interface, `attached` once it has it, `released` when the VMM
+    /// holds the host interface no more.
+    pub fn alias(&self, state: &str) -> String {
+        format!("nova-kata-net:{}:{}", self.port_id, state)
+    }
+}
+
+/// What the guest is told of an interface that has joined.
+#[derive(Clone, Debug)]
+pub struct AttachedEndpoint {
+    pub interface: agent::Interface,
+    pub host_interface: String,
+}
+
+fn network_update_unsupported<T>() -> Result<T> {
+    Err(anyhow::anyhow!(
+        "network_update_unsupported: this network changes no endpoint of a running guest"
+    ))
+}
+
 #[async_trait]
 pub trait Network: Send + Sync {
+    /// Nova Kata (ADR-044): give the VMM the interface. Repeated for an
+    /// interface the guest has, it changes nothing.
+    async fn attach_endpoint(&self, _update: &EndpointUpdate) -> Result<AttachedEndpoint> {
+        network_update_unsupported()
+    }
+    /// The guest has been told of the interface.
+    async fn confirm_endpoint(&self, _update: &EndpointUpdate) -> Result<()> {
+        network_update_unsupported()
+    }
+    /// Read again the addresses, routes and neighbours of the interfaces
+    /// the guest has: the owner of the namespace has changed them.
+    async fn refresh(&self) -> Result<()> {
+        network_update_unsupported()
+    }
+    /// Take the interface from the VMM. With `keep` the host interface
+    /// stays, labelled `released`, as the evidence of it; without, it is
+    /// deleted, as after an attach that failed.
+    async fn detach_endpoint(&self, _update: &EndpointUpdate, _keep: bool) -> Result<()> {
+        network_update_unsupported()
+    }
     async fn setup(&self) -> Result<()>;
     async fn interfaces(&self) -> Result<Vec<agent::Interface>>;
     async fn routes(&self) -> Result<Vec<agent::Route>>;

@@ -33,6 +33,8 @@ pub struct ContainerInner {
     pub(crate) exec_processes: HashMap<String, Exec>,
     pub(crate) rootfs: Vec<Arc<dyn Rootfs>>,
     pub(crate) volumes: Vec<Arc<dyn Volume>>,
+    pub(crate) live_growth: HashMap<String, super::live_volume_growth::PendingGrowth>,
+    pub(crate) live_volumes: HashMap<String, super::live_volume::PendingVolume>,
     pub(crate) linux_resources: Option<LinuxResources>,
 }
 
@@ -50,6 +52,8 @@ impl ContainerInner {
             exec_processes: HashMap::new(),
             rootfs: vec![],
             volumes: vec![],
+            live_volumes: HashMap::new(),
+            live_growth: HashMap::new(),
             linux_resources,
         }
     }

@@ -34,6 +34,8 @@ service AgentService {
 	rpc SignalProcess(SignalProcessRequest) returns (google.protobuf.Empty);
 	rpc WaitProcess(WaitProcessRequest) returns (WaitProcessResponse); // wait & reap like waitpid(2)
 	rpc UpdateContainer(UpdateContainerRequest) returns (google.protobuf.Empty);
+	rpc AttachBlockDevice(AttachBlockDeviceRequest) returns (google.protobuf.Empty);
+	rpc DetachBlockDevice(DetachBlockDeviceRequest) returns (google.protobuf.Empty);
 	rpc UpdateEphemeralMounts(UpdateEphemeralMountsRequest) returns (google.protobuf.Empty);
 	rpc StatsContainer(StatsContainerRequest) returns (StatsContainerResponse);
 	rpc PauseContainer(PauseContainerRequest) returns (google.protobuf.Empty);
@@ -655,4 +657,18 @@ message MemAgentCompactConfig {
 	optional uint32 compact_order = 6;
 	optional uint64 compact_threshold = 7;
 	optional uint64 compact_force_times = 8;
+}
+
+// Experimental native running-workload block attachment.
+message AttachBlockDeviceRequest {
+ string container_id = 1;
+ string request_id = 2;
+ Device device = 3;
+}
+
+message DetachBlockDeviceRequest {
+ string container_id = 1;
+ string request_id = 2;
+ string attach_request_id = 3;
+ string phase = 4;
 }

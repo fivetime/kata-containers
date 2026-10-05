@@ -1489,6 +1489,26 @@ pub struct DeviceVirtioNet {
     iommu_platform: bool,
     bus_type: VirtioBusType,
     devno: Option<String>,
+
+    // Nova Kata (ADR-044): the bridge and slot of a device of the command
+    // line. On a bridge and with an id the device can be removed from the
+    // running guest, as one that was hot-plugged.
+    pci_slot: Option<(String, i64)>,
+}
+
+/// Nova Kata (ADR-044): the bridge and slot of the index-th network device of
+/// the command line, or None for a device that stays where it was: without a
+/// bridge, on the CCW bus, and beyond the slots whose two digits name them.
+pub fn boot_network_slot(config: &HypervisorConfig, index: usize) -> Option<(String, i64)> {
+    const LAST_SLOT: usize = 19;
+    if bus_type() != VirtioBusType::Pci || config.device_info.default_bridges == 0 {
+        return None;
+    }
+    let slot = index + 1;
+    if slot > LAST_SLOT {
+        return None;
+    }
+    Some(("pci-bridge-0".to_owned(), slot as i64))
 }
 
 impl DeviceVirtioNet {
@@ -1507,7 +1527,13 @@ impl DeviceVirtioNet {
             iommu_platform: false,
             bus_type,
             devno,
+            pci_slot: None,
         }
+    }
+
+    fn set_pci_slot(&mut self, pci_slot: Option<(String, i64)>) -> &mut Self {
+        self.pci_slot = pci_slot;
+        self
     }
 
     fn set_disable_modern(&mut self, disable_modern: bool) -> &mut Self {
@@ -1567,6 +1593,12 @@ impl ToQemuParams for DeviceVirtioNet {
         params.push("mq=on".to_owned());
         if self.bus_type == VirtioBusType::Pci {
             params.push(format!("vectors={}", 2 * self.num_queues + 2));
+        }
+        if let Some((bus, slot)) = &self.pci_slot {
+            // The names and the form of the address of a hot-plugged device.
+            params.push(format!("id=frontend-{}", &self.netdev_id));
+            params.push(format!("bus={bus}"));
+            params.push(format!("addr={slot:02}"));
         }
 
         Ok(vec!["-device".to_owned(), params.join(",")])
@@ -2978,6 +3010,8 @@ pub struct QemuCmdLine<'a> {
     block_fdsets: HashMap<String, Vec<i64>>,
     next_fdset_id: i64,
     requires_memlock: bool,
+    // Nova Kata (ADR-044): how many network devices the line has.
+    network_devices: usize,
 }
 
 impl<'a> QemuCmdLine<'a> {
@@ -3002,6 +3036,7 @@ impl<'a> QemuCmdLine<'a> {
             block_fdsets: HashMap::new(),
             next_fdset_id: 1,
             requires_memlock: false,
+            network_devices: 0,
         };
 
         // add_virtiofs_share() installs the file-backed memory backend when
@@ -3231,7 +3266,14 @@ impl<'a> QemuCmdLine<'a> {
         mount_tag: &str,
         queue_size: u64,
     ) {
-        let chardev_name = "virtiofsd-chardev";
+        // The sandbox's own device keeps its id; every other tag (Nova
+        // shares, ADR-045, [A-Za-z0-9-]) gets its own chardev.
+        let chardev_name = if mount_tag == "kataShared" {
+            "virtiofsd-chardev".to_owned()
+        } else {
+            format!("virtiofsd-chardev-{mount_tag}")
+        };
+        let chardev_name = chardev_name.as_str();
 
         // virtiofsd socket device
         let mut virtiofsd_socket_chardev = ChardevSocket::new(chardev_name);
@@ -3401,13 +3443,15 @@ impl<'a> QemuCmdLine<'a> {
         guest_mac: Address,
         num_queues: u32,
     ) -> Result<()> {
-        let (netdev, virtio_net_device) = get_network_device(
+        let (netdev, mut virtio_net_device) = get_network_device(
             self.config,
             host_dev_name,
             guest_mac,
             &mut self.ccw_subchannel,
             num_queues,
         )?;
+        virtio_net_device.set_pci_slot(boot_network_slot(self.config, self.network_devices));
+        self.network_devices += 1;
 
         self.devices.push(Box::new(netdev));
         self.devices.push(Box::new(virtio_net_device));
@@ -4069,6 +4113,47 @@ mod tests {
 
     #[actix_rt::test]
     #[serial]
+    async fn nova_shares_qemu_two_virtio_fs_devices() {
+        let config = test_qemu_config(Some("virtio-fs"), false);
+        let _ = std::fs::remove_file(QMP_SOCKET_FILE);
+        let mut cmdline = QemuCmdLine::new("nova-shares", &config).unwrap();
+        cmdline.add_virtiofs_share("/run/kata/s/root/virtiofsd.sock", "kataShared", 1024);
+        cmdline.add_virtiofs_share("/run/kata/s/root/virtiofsd-share-0.sock", "share-a", 1024);
+        cmdline.add_virtiofs_share("/run/kata/s/root/virtiofsd-share-1.sock", "share-b", 1024);
+        let params = cmdline.build().await.unwrap();
+        drop(cmdline);
+        let _ = std::fs::remove_file(QMP_SOCKET_FILE);
+
+        let chardevs: Vec<&String> = params
+            .windows(2)
+            .filter(|args| args[0] == "-chardev" && args[1].contains("virtiofsd"))
+            .map(|args| &args[1])
+            .collect();
+        assert_eq!(chardevs.len(), 3, "{params:?}");
+        assert!(chardevs[0].contains("id=virtiofsd-chardev,path=/run/kata/s/root/virtiofsd.sock"));
+        assert!(chardevs[1]
+            .contains("id=virtiofsd-chardev-share-a,path=/run/kata/s/root/virtiofsd-share-0.sock"));
+        assert!(chardevs[2]
+            .contains("id=virtiofsd-chardev-share-b,path=/run/kata/s/root/virtiofsd-share-1.sock"));
+        let devices: Vec<&String> = params
+            .windows(2)
+            .filter(|args| args[0] == "-device" && args[1].starts_with("vhost-user-fs-"))
+            .map(|args| &args[1])
+            .collect();
+        assert_eq!(devices.len(), 3);
+        assert!(devices[0].contains("chardev=virtiofsd-chardev,tag=kataShared"));
+        assert!(devices[1].contains("chardev=virtiofsd-chardev-share-a,tag=share-a"));
+        assert!(devices[2].contains("chardev=virtiofsd-chardev-share-b,tag=share-b"));
+        // One shared guest memory backend, whatever the number of devices.
+        let backends = params
+            .iter()
+            .filter(|arg| arg.contains("id=entire-guest-memory-share"))
+            .count();
+        assert_eq!(backends, 1);
+    }
+
+    #[actix_rt::test]
+    #[serial]
     async fn test_qemu_ram_backend_without_shared_fs_and_without_prealloc() {
         let config = test_qemu_config(Some("none"), false);
         let params = build_test_cmdline("ram-no-prealloc", &config).await;
@@ -4335,5 +4420,52 @@ mod tests {
             .collect();
 
         assert_eq!(values, expected_values);
+    }
+}
+
+#[cfg(test)]
+mod nova_live_network_tests {
+    use super::*;
+
+    fn config(bridges: u32) -> HypervisorConfig {
+        let mut config = HypervisorConfig::default();
+        config.device_info.default_bridges = bridges;
+        config
+    }
+
+    #[test]
+    fn network_devices_of_the_command_line_take_the_first_slots_of_the_bridge() {
+        if bus_type() != VirtioBusType::Pci {
+            return;
+        }
+        let config = config(1);
+        assert_eq!(
+            boot_network_slot(&config, 0),
+            Some(("pci-bridge-0".to_owned(), 1))
+        );
+        assert_eq!(
+            boot_network_slot(&config, 18),
+            Some(("pci-bridge-0".to_owned(), 19))
+        );
+        // Beyond the slots two decimal digits name as they are.
+        assert_eq!(boot_network_slot(&config, 19), None);
+        assert_eq!(boot_network_slot(&self::config(0), 0), None);
+    }
+
+    #[actix_rt::test]
+    async fn a_device_on_the_bridge_has_the_names_of_a_hot_plugged_one() {
+        let mac = Address([0xfa, 0x16, 0x3e, 0x11, 0x22, 0x33]);
+        let mut device = DeviceVirtioNet::new("network-tap0_kata", mac, VirtioBusType::Pci, None);
+        let plain = device.qemu_params().await.unwrap();
+        assert!(!plain[1].contains("id=") && !plain[1].contains("bus="));
+        device.set_pci_slot(Some(("pci-bridge-0".to_owned(), 3)));
+        let params = device.qemu_params().await.unwrap();
+        assert_eq!(params[0], "-device");
+        assert!(params[1].starts_with(
+            "virtio-net-pci,netdev=network-tap0_kata,mac=fa:16:3e:11:22:33"
+        ));
+        assert!(params[1].ends_with(
+            ",id=frontend-network-tap0_kata,bus=pci-bridge-0,addr=03"
+        ));
     }
 }

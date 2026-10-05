@@ -26,7 +26,23 @@ pub struct DevicesCgroupInfo {
     allowed_all: bool,
 }
 
+pub(crate) mod nova_wait;
+
 pub trait Manager {
+    // True means an owned kernel subtree kill was dispatched (or this exact
+    // owner previously completed removal), not that exit/release is proven.
+    fn kill_all(&self) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn owned_empty(&self) -> Result<bool> {
+        Err(anyhow!("original cgroup owner unavailable"))
+    }
+
+    fn owned_frozen(&self) -> Result<bool> {
+        Err(anyhow!("original cgroup freeze observation unavailable"))
+    }
+
     fn apply(&self, _pid: i32) -> Result<()> {
         Err(anyhow!("not supported!".to_string()))
     }

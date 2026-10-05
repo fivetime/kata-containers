@@ -182,6 +182,38 @@ impl DeviceManager {
         Ok(())
     }
 
+    /// Nova Kata (ADR-044): take the network device of the host interface
+    /// from the running guest. The device leaves the manager only when the
+    /// hypervisor has removed it.
+    pub async fn remove_network_device(&mut self, host_dev_name: &str) -> Result<()> {
+        let device_id = self
+            .find_device(host_dev_name.to_owned())
+            .await
+            .ok_or_else(|| {
+                anyhow!(
+                    "network_update_conflict: no device of host interface {}",
+                    host_dev_name
+                )
+            })?;
+        let DeviceType::Network(device) = self.get_device_info(&device_id).await? else {
+            return Err(anyhow!(
+                "network_update_conflict: {} is no network device",
+                host_dev_name
+            ));
+        };
+        if !self.hypervisor.supports_network_removal() {
+            return Err(anyhow!(
+                "network_update_unsupported: this hypervisor removes no network device"
+            ));
+        }
+        self.hypervisor
+            .remove_network_device(device)
+            .await
+            .context("remove network device")?;
+        self.devices.remove(&device_id);
+        Ok(())
+    }
+
     pub async fn try_remove_device(&mut self, device_id: &str) -> Result<()> {
         if let Some(dev) = self.devices.get(device_id) {
             let mut device_guard = dev.lock().await;
@@ -311,6 +343,17 @@ impl DeviceManager {
             DeviceConfig::BlockCfgModern(config) => {
                 if let Some(device_matched_id) = self.find_device(config.path_on_host.clone()).await
                 {
+                    // A device is shared only with the limits it was added with.
+                    if let DeviceType::BlockModern(device) =
+                        self.get_device_info(&device_matched_id).await?
+                    {
+                        if device.lock().await.config.io_limits != config.io_limits {
+                            return Err(anyhow!(
+                                "volume_qos_conflict: {} is attached with other limits",
+                                config.path_on_host
+                            ));
+                        }
+                    }
                     return Ok(device_matched_id);
                 }
 
@@ -748,5 +791,20 @@ mod tests {
         } else {
             assert_eq!(1, 0)
         }
+    }
+}
+
+// SPDX-License-Identifier: Apache-2.0
+impl DeviceManager {
+    pub fn supports_block_growth(&self) -> bool {
+        self.hypervisor.supports_block_growth()
+    }
+    /// Caller holds the manager write lock and the owning attachment lock.
+    /// Lookup only an existing device ID; never create or search by display path.
+    pub async fn grow_block_device(&mut self, device_id: &str, requested: u64) -> Result<()> {
+        let handle = self.devices.get(device_id).context("block growth device is absent")?;
+        let device = handle.lock().await;
+        let info = device.get_device_info().await;
+        self.hypervisor.grow_block_device(info, requested).await
     }
 }

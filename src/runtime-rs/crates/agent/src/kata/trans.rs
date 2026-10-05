@@ -923,3 +923,26 @@ impl From<AddSwapPathRequest> for agent::AddSwapPathRequest {
         }
     }
 }
+
+impl From<crate::AttachBlockDeviceRequest> for agent::AttachBlockDeviceRequest {
+    fn from(from: crate::AttachBlockDeviceRequest) -> Self {
+        Self {
+            container_id: from.container_id,
+            request_id: from.request_id,
+            device: protobuf::MessageField::some(from.device.into()),
+            ..Default::default()
+        }
+    }
+}
+
+impl From<crate::DetachBlockDeviceRequest> for agent::DetachBlockDeviceRequest {
+    fn from(from: crate::DetachBlockDeviceRequest) -> Self {
+        Self {
+            container_id: from.container_id,
+            request_id: from.request_id,
+            attach_request_id: from.attach_request_id,
+            phase: from.phase,
+            ..Default::default()
+        }
+    }
+}

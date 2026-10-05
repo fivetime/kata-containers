@@ -76,6 +76,20 @@ impl<E: IoEngine + Send> Ufile for LocalFile<E> {
         self.capacity
     }
 
+    fn refresh_capacity(&mut self) -> io::Result<u64> {
+        // The data plane reads and writes at offsets: moving the file
+        // position disturbs nothing.
+        let capacity = self.file.seek(SeekFrom::End(0))?;
+        if capacity < self.capacity {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("disk capacity shrank from {} to {}", self.capacity, capacity),
+            ));
+        }
+        self.capacity = capacity;
+        Ok(capacity)
+    }
+
     fn get_max_size(&self) -> u32 {
         // Set max size to 1M to avoid interferes with rate limiter.
         0x100000
@@ -289,6 +303,23 @@ mod tests {
         let bytes_read = file_with_iouring.read(&mut content).unwrap();
         assert_eq!(bytes_read, size_of_content - start);
         assert_eq!(content, original_content[start..]);
+    }
+
+    #[test]
+    fn nova_block_growth_refresh_capacity() {
+        // A backend that grew is taken; one that shrank is refused and the
+        // capacity kept.
+        let file = TempFile::new().unwrap().into_file();
+        file.set_len(4096).unwrap();
+        let handle = file.try_clone().unwrap();
+        let mut disk = LocalFile::new(file, false, new_aio_engine()).unwrap();
+        assert_eq!(disk.get_capacity(), 4096);
+        handle.set_len(8192).unwrap();
+        assert_eq!(disk.refresh_capacity().unwrap(), 8192);
+        assert_eq!(disk.get_capacity(), 8192);
+        handle.set_len(4096).unwrap();
+        assert!(disk.refresh_capacity().is_err());
+        assert_eq!(disk.get_capacity(), 8192);
     }
 
     #[test]

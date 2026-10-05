@@ -268,6 +268,8 @@ pub struct LinuxContainer {
     // paths stored in the OCI spec. Keeping the files open makes those paths continue
     // to resolve to the original namespaces.
     pinned_namespace_fds: HashMap<oci::LinuxNamespaceType, fs::File>,
+    workload_dev: Option<fs::File>,
+    live_block_nodes: crate::live_block_device::BlockDeviceNodes,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -1246,9 +1248,17 @@ impl BaseContainer for LinuxContainer {
         info!(logger, "entered namespaces!");
 
         if p.init {
+            let workload_dev = &mut self.workload_dev;
+            let live_block_nodes = &mut self.live_block_nodes;
             let spec = self.config.spec.as_mut().unwrap();
             if let Err(e) =
                 update_namespaces(&self.logger, spec, p.pid, &mut self.pinned_namespace_fds)
+                    .and_then(|_| {
+                        let directory = crate::live_block_device::pin_workload_dev(p.pid)?;
+                        *live_block_nodes = crate::live_block_device::BlockDeviceNodes::capture_created(&directory, spec)?;
+                        *workload_dev = Some(directory);
+                        Ok(())
+                    })
             {
                 // Pinning failed before the init process was added to self.processes.
                 // Kill it so an untracked child is not left blocked on the exec FIFO.
@@ -1313,13 +1323,20 @@ impl BaseContainer for LinuxContainer {
             )?;
         }
 
+        self.workload_dev.take();
+        self.live_block_nodes = Default::default();
         self.status.transition(ContainerState::Stopped);
 
         // Kill all of the processes created in this container to prevent
         // the leak of some daemon process when this container shared pidns
         // with the sandbox.
         let cgm = self.cgroup_manager.as_ref();
-        let pids = cgm.get_pids().context("get cgroup pids")?;
+        let owned_kill = cgm.kill_all().context("kill owned cgroup subtree")?;
+        let pids = if owned_kill {
+            Vec::new()
+        } else {
+            cgm.get_pids().context("get cgroup pids")?
+        };
         info!(
             self.logger,
             "destroy: container {} cgroup has {} processes: {:?}",
@@ -1341,6 +1358,15 @@ impl BaseContainer for LinuxContainer {
             self.logger,
             "destroy: destroying cgroup for container {}", self.id
         );
+        if owned_kill {
+            // Keep the same manager/owner across suspension. Cancellation and
+            // errors leave its attachment fence and handles intact for retry.
+            crate::cgroups::nova_wait::wait_empty(std::time::Duration::from_secs(5), || {
+                cgm.owned_empty()
+            })
+            .await
+            .context("wait for original Nova cgroup exit")?;
+        }
         cgm.destroy().context("destroy cgroups")?;
 
         // Now umount and remove the container's root directory.
@@ -1729,6 +1755,17 @@ fn setid(uid: Uid, gid: Gid) -> Result<()> {
 }
 
 impl LinuxContainer {
+    /// Node creation only; caller must coordinate discovered device identity,
+    /// cgroup permissions and request ownership before reporting attachment.
+    pub fn create_live_block_node(&self, name: &str, major: u32, minor: u32) -> Result<()> {
+        if self.status() != ContainerState::Running {
+            return Err(anyhow!("live device operation requires running container"));
+        }
+        let directory = self.workload_dev.as_ref()
+            .ok_or_else(|| anyhow!("workload device directory was not captured at creation"))?;
+        crate::live_block_device::create_block_node(directory, name, major, minor)
+    }
+
     pub fn new<T: Into<String> + Display + Clone>(
         id: T,
         base: T,
@@ -1806,6 +1843,8 @@ impl LinuxContainer {
                 .as_secs(),
             logger: logger.new(o!("module" => "rustjail", "subsystem" => "container", "cid" => id)),
             pinned_namespace_fds: HashMap::new(),
+            workload_dev: None,
+            live_block_nodes: Default::default(),
         })
     }
 }
@@ -2273,5 +2312,64 @@ mod tests {
     fn test_linuxcontainer_do_init_child() {
         let ret = do_init_child(std::io::stdin().as_raw_fd());
         assert!(ret.is_err(), "Expecting Err, Got {:?}", ret);
+    }
+}
+
+impl LinuxContainer {
+    pub fn detach_live_block_device(&mut self, attach_id: &str, request_id: &str, phase: &str) -> Result<()> {
+        if !matches!(phase, "prepare" | "complete") { return Err(anyhow!("unsupported block detach phase")); }
+        // Read-only replay must succeed after the original operation resumed.
+        if self.live_block_nodes.detach_completed(attach_id, request_id)? { return Ok(()); }
+        let directory = self.quiesced_device_directory()?;
+        match phase {
+            "prepare" => self.live_block_nodes.prepare_detach(&directory, attach_id, request_id),
+            "complete" => self.live_block_nodes.complete_detach(attach_id, request_id),
+            _ => Err(anyhow!("unsupported block detach phase")),
+        }
+    }
+
+    /// A Paused status alone does not prove the kernel completed freezing.
+    /// Callers must hold the sandbox operation lock through device inspection.
+    pub fn quiesced_device_directory(&self) -> Result<fs::File> {
+        if self.status() != ContainerState::Paused {
+            return Err(anyhow!("device removal requires completed workload freeze"));
+        }
+        if !self.cgroup_manager.owned_frozen()? {
+            return Err(crate::live_block_device::DetachAdmission::FreezePending.into());
+        }
+        self.workload_dev.as_ref()
+            .ok_or_else(|| anyhow!("workload device directory unavailable"))?
+            .try_clone().context("retain frozen workload device directory")
+    }
+
+    pub fn live_device_directory(&self, request_id: &str) -> Result<fs::File> {
+        if self.status() == ContainerState::Paused {
+            if !self.live_block_nodes.contains_active(request_id) {
+                return Err(anyhow!("paused device verification requires original registration"));
+            }
+            return self.quiesced_device_directory();
+        }
+        if self.status() != ContainerState::Running {
+            return Err(anyhow!("live device operation requires running container"));
+        }
+        self.workload_dev.as_ref()
+            .ok_or_else(|| anyhow!("workload device directory unavailable"))?
+            .try_clone().context("retain live device directory")
+    }
+
+    pub fn attach_live_block_device(&mut self, original: &fs::File,
+        request_id: &str, request: &str, name: &str, major: u32, minor: u32) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let current = self.live_device_directory(request_id)?;
+        let left = original.metadata()?;
+        let right = current.metadata()?;
+        if left.dev() != right.dev() || left.ino() != right.ino() {
+            return Err(anyhow!("container changed during device discovery"));
+        }
+        if self.status() == ContainerState::Paused {
+            self.live_block_nodes.verify_existing(&current, request_id, request, name, major, minor)
+        } else {
+            self.live_block_nodes.attach(&current, request_id, request, name, major, minor)
+        }
     }
 }
