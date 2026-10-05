@@ -246,7 +246,7 @@ mod tests {
                 "networks":[{"mac":"fa:16:3e:00:00:01","bus":"pci-bridge-0","slot":1},
                             {"mac":"fa:16:3e:00:00:02","bus":"pci-bridge-0","slot":1}]}"#,
         ] {
-            assert!(migrate_in(&request(body)).is_err(), "{body}");
+            assert!(migrate_in(&request(body)).is_err(), "{}", body);
         }
         let other = HashMap::from([(
             "io.openstack.nova.kata.migrate-in.v2".to_string(),

@@ -1586,6 +1586,7 @@ impl Persist for QemuInner {
             netns: None,
 
             exit_notify: Some(exit_notify),
+            incoming: None,
         })
     }
 }

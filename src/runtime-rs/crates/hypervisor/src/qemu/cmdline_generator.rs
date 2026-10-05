@@ -3477,6 +3477,7 @@ impl<'a> QemuCmdLine<'a> {
         guest_mac: Address,
         num_queues: u32,
     ) -> Result<()> {
+        let mac = format!("{guest_mac:?}");
         let (netdev, mut virtio_net_device) = get_network_device(
             self.config,
             host_dev_name,
@@ -3484,7 +3485,7 @@ impl<'a> QemuCmdLine<'a> {
             &mut self.ccw_subchannel,
             num_queues,
         )?;
-        let place = match self.network_pins.get(&format!("{guest_mac:?}")) {
+        let place = match self.network_pins.get(&mac) {
             Some(place) => Some(place.clone()),
             None => boot_network_slot(self.config, self.network_devices),
         };

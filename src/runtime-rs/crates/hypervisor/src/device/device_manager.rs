@@ -69,6 +69,9 @@ struct SharedInfo {
     block_index: u64,
     released_pmem_index: Vec<u64>,
     released_block_index: Vec<u64>,
+    // Nova Kata (ADR-052): on a migration's destination, the index each
+    // block device (by its host path) had on the source.
+    block_index_pins: HashMap<String, u64>,
 }
 
 impl SharedInfo {
@@ -78,7 +81,39 @@ impl SharedInfo {
             block_index: 0,
             released_pmem_index: vec![],
             released_block_index: vec![],
+            block_index_pins: HashMap::new(),
         }
+    }
+
+    /// The pinned indexes are held back from the free ones: the counter
+    /// starts after the highest, and the lower indexes no pin names are the
+    /// free ones, so a device without a pin never takes a pinned index.
+    fn set_block_index_pins(&mut self, pins: HashMap<String, u64>) -> Result<()> {
+        if self.block_index != 0 || !self.released_block_index.is_empty() {
+            return Err(anyhow!(
+                "migration_invalid: block indexes are pinned after a block device was added"
+            ));
+        }
+        let pinned: std::collections::HashSet<u64> = pins.values().copied().collect();
+        if pinned.len() != pins.len() {
+            return Err(anyhow!("migration_invalid: two block devices pin one index"));
+        }
+        if let Some(highest) = pinned.iter().max() {
+            self.block_index = highest + 1;
+            self.released_block_index = (0..*highest).filter(|i| !pinned.contains(i)).collect();
+            self.released_block_index.sort_by(|a, b| b.cmp(a));
+        }
+        self.block_index_pins = pins;
+        Ok(())
+    }
+
+    /// The index of a block device: its pin, which is taken once, or a free
+    /// one.
+    fn declare_block_index_for(&mut self, path: &str) -> Result<u64> {
+        if let Some(index) = self.block_index_pins.remove(path) {
+            return Ok(index);
+        }
+        self.declare_device_index(false)
     }
 
     fn declare_device_index(&mut self, is_pmem: bool) -> Result<u64> {
@@ -313,13 +348,31 @@ impl DeviceManager {
         None
     }
 
+    /// Nova Kata (ADR-052): on a migration's destination, every block
+    /// device takes the index it had on the source.
+    pub fn set_block_index_pins(&mut self, pins: HashMap<String, u64>) -> Result<()> {
+        self.shared_info.set_block_index_pins(pins)
+    }
+
     fn get_dev_virt_path(
         &mut self,
         dev_type: &str,
         is_pmem: bool,
     ) -> Result<Option<(u64, String)>> {
+        self.get_dev_virt_path_for(dev_type, is_pmem, None)
+    }
+
+    fn get_dev_virt_path_for(
+        &mut self,
+        dev_type: &str,
+        is_pmem: bool,
+        host_path: Option<&str>,
+    ) -> Result<Option<(u64, String)>> {
         let virt_path = if dev_type == DEVICE_TYPE_BLOCK {
-            let current_index = self.shared_info.declare_device_index(is_pmem)?;
+            let current_index = match host_path {
+                Some(path) if !is_pmem => self.shared_info.declare_block_index_for(path)?,
+                _ => self.shared_info.declare_device_index(is_pmem)?,
+            };
             let drive_name = if is_pmem {
                 format!("pmem{current_index}")
             } else {
@@ -554,15 +607,18 @@ impl DeviceManager {
             }
         };
 
-        if let Some(virt_path) = self.get_dev_virt_path(DEVICE_TYPE_BLOCK, is_pmem)? {
-            block_config.index = virt_path.0;
-            block_config.virt_path = virt_path.1;
-        }
-
         if block_config.path_on_host.is_empty() {
             block_config.path_on_host =
                 get_host_path(DEVICE_TYPE_BLOCK, config.major, config.minor)
                     .context("failed to get host path")?;
+        }
+
+        let host_path = block_config.path_on_host.clone();
+        if let Some(virt_path) =
+            self.get_dev_virt_path_for(DEVICE_TYPE_BLOCK, is_pmem, Some(&host_path))?
+        {
+            block_config.index = virt_path.0;
+            block_config.virt_path = virt_path.1;
         }
 
         Ok(Arc::new(Mutex::new(BlockDeviceModernHandle::new(
@@ -730,7 +786,8 @@ pub async fn find_cold_plugged_vfio_ap(
 
 #[cfg(test)]
 mod tests {
-    use super::DeviceManager;
+    use super::{DeviceManager, SharedInfo};
+    use std::collections::HashMap;
     use crate::{
         device::{device_manager::get_block_device_info, DeviceConfig, DeviceType},
         qemu::Qemu,
@@ -741,6 +798,43 @@ mod tests {
     use std::sync::Arc;
     use tests_utils::load_test_config;
     use tokio::sync::RwLock;
+
+    #[tokio::test]
+    async fn pinned_block_indexes_are_kept_and_free_ones_fill_the_holes() {
+        let mut info = SharedInfo::new().await;
+        info.set_block_index_pins(HashMap::from([
+            ("/dev/rbd3".to_string(), 0),
+            ("/dev/rbd5".to_string(), 3),
+        ]))
+        .unwrap();
+        // A device without a pin takes a free index, never a pinned one.
+        assert_eq!(info.declare_block_index_for("/other").unwrap(), 1);
+        assert_eq!(info.declare_block_index_for("/dev/rbd5").unwrap(), 3);
+        assert_eq!(info.declare_block_index_for("/dev/rbd3").unwrap(), 0);
+        assert_eq!(info.declare_block_index_for("/another").unwrap(), 2);
+        // The counter moves on with every index declared (upstream's
+        // declare_index!), so the next ones are new and unique.
+        let third = info.declare_block_index_for("/a-third").unwrap();
+        assert!(third > 3);
+        // A pin is taken once.
+        assert!(info.declare_block_index_for("/dev/rbd3").unwrap() > third);
+    }
+
+    #[tokio::test]
+    async fn block_indexes_are_pinned_before_any_device() {
+        let mut info = SharedInfo::new().await;
+        info.declare_device_index(false).unwrap();
+        assert!(info
+            .set_block_index_pins(HashMap::from([("/a".to_string(), 0)]))
+            .is_err());
+        let mut info = SharedInfo::new().await;
+        assert!(info
+            .set_block_index_pins(HashMap::from([
+                ("/a".to_string(), 1),
+                ("/b".to_string(), 1)
+            ]))
+            .is_err());
+    }
 
     async fn new_device_manager() -> Result<Arc<RwLock<DeviceManager>>> {
         let hypervisor_name: &str = "qemu";
