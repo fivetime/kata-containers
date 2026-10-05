@@ -59,10 +59,14 @@ impl Hypervisor for Qemu {
         &self,
         id: &str,
         netns: Option<String>,
-        _annotations: &HashMap<String, String>,
+        annotations: &HashMap<String, String>,
         selinux_label: Option<String>,
     ) -> Result<()> {
+        // Nova Kata (ADR-052): a malformed migrate-in request fails the
+        // start; the sandbox never boots a fresh VM in its place.
+        let incoming = crate::migration::migrate_in(annotations)?;
         let mut inner = self.inner.write().await;
+        inner.set_incoming(incoming);
         inner.prepare_vm(id, netns, selinux_label).await
     }
 
@@ -128,6 +132,28 @@ impl Hypervisor for Qemu {
     async fn remove_network_device(&self, device: crate::NetworkDevice) -> Result<()> {
         let mut inner = self.inner.write().await;
         inner.remove_network_device(device).await
+    }
+    fn supports_live_migration(&self) -> bool {
+        true
+    }
+    async fn migration_send(
+        &self,
+        uri: &str,
+        params: &crate::migration::MigrationParams,
+    ) -> Result<()> {
+        self.inner.write().await.migration_send(uri, params)
+    }
+    async fn migration_progress(&self) -> Result<crate::migration::MigrationProgress> {
+        self.inner.write().await.migration_progress()
+    }
+    async fn migration_cancel(&self) -> Result<()> {
+        self.inner.write().await.migration_cancel()
+    }
+    async fn migration_receive(&self) -> Result<()> {
+        self.inner.write().await.migration_receive()
+    }
+    async fn migration_networks(&self) -> Result<Vec<crate::migration::NetworkPin>> {
+        self.inner.read().await.migration_networks()
     }
     fn supports_block_growth(&self) -> bool { true }
     async fn grow_block_device(&self, device: DeviceType, requested: u64) -> Result<()> {

@@ -1705,6 +1705,18 @@ impl ToQemuParams for Rtc {
     }
 }
 
+// Nova Kata (ADR-052): a VM that receives a live migration: QEMU waits for
+// migrate-incoming, and the guest does not run until `cont`.
+#[derive(Debug)]
+struct Incoming {}
+
+#[async_trait]
+impl ToQemuParams for Incoming {
+    async fn qemu_params(&self) -> Result<Vec<String>> {
+        Ok(vec!["-incoming".to_owned(), "defer".to_owned(), "-S".to_owned()])
+    }
+}
+
 // Template represents QEMU template boot configuration.
 #[derive(Debug)]
 struct Template {}
@@ -3012,6 +3024,9 @@ pub struct QemuCmdLine<'a> {
     requires_memlock: bool,
     // Nova Kata (ADR-044): how many network devices the line has.
     network_devices: usize,
+    // Nova Kata (ADR-052): the place each guest MAC had on a migration's
+    // source.
+    network_pins: HashMap<String, (String, i64)>,
 }
 
 impl<'a> QemuCmdLine<'a> {
@@ -3037,6 +3052,7 @@ impl<'a> QemuCmdLine<'a> {
             next_fdset_id: 1,
             requires_memlock: false,
             network_devices: 0,
+            network_pins: HashMap::new(),
         };
 
         // add_virtiofs_share() installs the file-backed memory backend when
@@ -3134,6 +3150,15 @@ impl<'a> QemuCmdLine<'a> {
     fn add_rtc(&mut self) {
         let rtc = Rtc::new();
         self.devices.push(Box::new(rtc));
+    }
+
+    /// Nova Kata (ADR-052): receive a migration instead of booting.
+    pub fn add_incoming(&mut self) {
+        self.devices.push(Box::new(Incoming {}));
+    }
+
+    pub fn set_network_pins(&mut self, pins: HashMap<String, (String, i64)>) {
+        self.network_pins = pins;
     }
 
     fn add_template(&mut self) {
@@ -3330,7 +3355,16 @@ impl<'a> QemuCmdLine<'a> {
         self.memory.max_size != 0 && self.memory.num_slots != 0
     }
 
-    pub fn add_nvdimm(&mut self, path: &str, is_readonly: bool) -> Result<()> {
+    /// `writable_backend`: the destination of a live migration maps the
+    /// image writable and private. QEMU migrates the image as RAM and
+    /// crashes loading it into a read-only mapping (ADR-052); the file is
+    /// never written and the guest's device stays as it was.
+    pub fn add_nvdimm(
+        &mut self,
+        path: &str,
+        is_readonly: bool,
+        writable_backend: bool,
+    ) -> Result<()> {
         self.machine.set_nvdimm(true);
         if self.memory.max_size == 0 || self.memory.num_slots == 0 {
             info!(
@@ -3351,7 +3385,7 @@ impl<'a> QemuCmdLine<'a> {
         };
 
         let mut mem_file = MemoryBackendFile::new("TODO", path, filesize);
-        mem_file.set_readonly(is_readonly);
+        mem_file.set_readonly(is_readonly && !writable_backend);
         self.devices.push(Box::new(mem_file));
 
         let nvdimm = DeviceNvdimm::new("TODO", is_readonly);
@@ -3450,7 +3484,11 @@ impl<'a> QemuCmdLine<'a> {
             &mut self.ccw_subchannel,
             num_queues,
         )?;
-        virtio_net_device.set_pci_slot(boot_network_slot(self.config, self.network_devices));
+        let place = match self.network_pins.get(&format!("{guest_mac:?}")) {
+            Some(place) => Some(place.clone()),
+            None => boot_network_slot(self.config, self.network_devices),
+        };
+        virtio_net_device.set_pci_slot(place);
         self.network_devices += 1;
 
         self.devices.push(Box::new(netdev));

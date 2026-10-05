@@ -11,6 +11,7 @@ logging::logger_with_subsystem!(sl, "hypervisor");
 
 pub mod device;
 pub mod hypervisor_persist;
+pub mod migration;
 pub use device::driver::*;
 pub use device::pci_path::PciPath;
 use device::DeviceType;
@@ -166,6 +167,34 @@ pub trait Hypervisor: std::fmt::Debug + Send + Sync {
         Err(anyhow::anyhow!(
             "network_update_unsupported: this hypervisor removes no network device"
         ))
+    }
+    /// Nova Kata (ADR-052): whether this VMM live-migrates its VM.
+    fn supports_live_migration(&self) -> bool {
+        false
+    }
+    /// Begin sending the running VM to `uri`; it returns once the transfer
+    /// began. migration_progress says how it stands.
+    async fn migration_send(
+        &self,
+        _uri: &str,
+        _params: &migration::MigrationParams,
+    ) -> Result<()> {
+        Err(anyhow::anyhow!("migration_unsupported: this hypervisor does not live-migrate"))
+    }
+    async fn migration_progress(&self) -> Result<migration::MigrationProgress> {
+        Err(anyhow::anyhow!("migration_unsupported: this hypervisor does not live-migrate"))
+    }
+    async fn migration_cancel(&self) -> Result<()> {
+        Err(anyhow::anyhow!("migration_unsupported: this hypervisor does not live-migrate"))
+    }
+    /// Begin receiving into the VM that prepare_vm started to receive,
+    /// once its devices are in place.
+    async fn migration_receive(&self) -> Result<()> {
+        Err(anyhow::anyhow!("migration_unsupported: this hypervisor does not live-migrate"))
+    }
+    /// The network devices of the running VM, by their guest MAC.
+    async fn migration_networks(&self) -> Result<Vec<migration::NetworkPin>> {
+        Err(anyhow::anyhow!("migration_unsupported: this hypervisor does not live-migrate"))
     }
     fn supports_block_growth(&self) -> bool { false }
     async fn grow_block_device(&self, _device: DeviceType, _requested: u64) -> Result<()> {

@@ -33,6 +33,7 @@ use kata_types::{
 use persist::sandbox_persist::Persist;
 use qapi_qmp::MigrationStatus;
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::convert::{TryFrom, TryInto};
 use std::fs;
 use std::io;
@@ -67,6 +68,9 @@ pub struct QemuInner {
     netns: Option<String>,
 
     exit_notify: Option<mpsc::Sender<()>>,
+
+    // Nova Kata (ADR-052): the VM receives a live migration.
+    incoming: Option<crate::migration::MigrateIn>,
 }
 
 impl QemuInner {
@@ -80,7 +84,74 @@ impl QemuInner {
             netns: None,
 
             exit_notify: Some(exit_notify),
+            incoming: None,
         }
+    }
+
+    /// Nova Kata (ADR-052): the sandbox's annotations ask this VM to
+    /// receive a migration; set before start_vm.
+    pub(crate) fn set_incoming(&mut self, incoming: Option<crate::migration::MigrateIn>) {
+        self.incoming = incoming;
+    }
+
+    fn network_pins(&self) -> HashMap<String, (String, i64)> {
+        self.incoming
+            .as_ref()
+            .map(|incoming| {
+                incoming
+                    .networks
+                    .iter()
+                    .map(|pin| (pin.mac.clone(), (pin.bus.clone(), pin.slot)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn migration_send(
+        &mut self,
+        uri: &str,
+        params: &crate::migration::MigrationParams,
+    ) -> Result<()> {
+        crate::migration::validate_tcp_uri(uri)?;
+        self.qmp
+            .as_mut()
+            .context("migration_unsupported: QMP is not connected")?
+            .migration_send(uri, params)
+    }
+
+    pub(crate) fn migration_progress(&mut self) -> Result<crate::migration::MigrationProgress> {
+        self.qmp
+            .as_mut()
+            .context("migration_unsupported: QMP is not connected")?
+            .migration_progress()
+    }
+
+    pub(crate) fn migration_cancel(&mut self) -> Result<()> {
+        self.qmp
+            .as_mut()
+            .context("migration_unsupported: QMP is not connected")?
+            .migration_cancel()
+    }
+
+    pub(crate) fn migration_receive(&mut self) -> Result<()> {
+        let uri = self
+            .incoming
+            .as_ref()
+            .context("migration_invalid: this VM does not receive a migration")?
+            .uri
+            .clone();
+        self.qmp
+            .as_mut()
+            .context("migration_unsupported: QMP is not connected")?
+            .execute_migration_incoming(&uri)
+    }
+
+    pub(crate) fn migration_networks(&self) -> Result<Vec<crate::migration::NetworkPin>> {
+        Ok(self
+            .qmp
+            .as_ref()
+            .context("migration_unsupported: QMP is not connected")?
+            .migration_networks())
     }
 
     pub(crate) async fn prepare_vm(
@@ -123,6 +194,11 @@ impl QemuInner {
         // open until spawn() is called to launch qemu later in this function,
         // 'cmdline' has to live at least until spawn() is called
         let mut cmdline = QemuCmdLine::new(&self.id, &self.config)?;
+        let incoming = self.incoming.is_some();
+        if incoming {
+            cmdline.add_incoming();
+            cmdline.set_network_pins(self.network_pins());
+        }
 
         for device in &mut self.devices {
             match device {
@@ -183,7 +259,9 @@ impl QemuInner {
                         continue;
                     }
                     match driver_option.as_str() {
-                        KATA_NVDIMM_DEV_TYPE => cmdline.add_nvdimm(&path_on_host, is_readonly)?,
+                        KATA_NVDIMM_DEV_TYPE => {
+                            cmdline.add_nvdimm(&path_on_host, is_readonly, incoming)?
+                        }
                         KATA_CCW_DEV_TYPE | KATA_BLK_DEV_TYPE | KATA_SCSI_DEV_TYPE => {
                             let serial = if serial_override.is_empty() {
                                 None
@@ -520,19 +598,34 @@ impl QemuInner {
                 // Nova Kata (ADR-044): the network devices of the command
                 // line hold slots of the bridge; a hot-plug must find them
                 // taken.
+                let pins = self.network_pins();
                 let mut index = 0;
                 for device in &self.devices {
                     if let DeviceType::Network(network) = device {
-                        if let Some((bridge, slot)) = boot_network_slot(&self.config, index) {
+                        let mac = network
+                            .config
+                            .guest_mac
+                            .as_ref()
+                            .map(|mac| format!("{mac:?}"))
+                            .unwrap_or_default();
+                        let place = match pins.get(&mac) {
+                            Some(place) => Some(place.clone()),
+                            None => boot_network_slot(&self.config, index),
+                        };
+                        if let Some((bridge, slot)) = place {
                             qmp.record_network_device(
                                 &bridge,
                                 slot,
                                 &network.config.host_dev_name,
+                                &mac,
                             );
                         }
                         index += 1;
                     }
                 }
+                // Nova Kata (ADR-052): a network device hot-plugged before
+                // the transfer takes the place it had on the source.
+                qmp.set_network_pins(pins);
                 self.qmp = Some(qmp);
             }
             Err(e) => {

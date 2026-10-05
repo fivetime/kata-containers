@@ -21,7 +21,7 @@ use qapi_qmp::{
     MigrationInfo, PciDeviceInfo,
 };
 use qapi_qmp::{migrate, migrate_incoming, migrate_set_capabilities};
-use qapi_qmp::{MigrationCapability, MigrationCapabilityStatus};
+use qapi_qmp::{MigrationCapability, MigrationCapabilityStatus, MigrationStatus};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fmt::{Debug, Error, Formatter};
@@ -87,6 +87,12 @@ pub struct Qmp {
     // backend is removed because format drivers such as VMDK may reopen an
     // extent after blockdev-add completes.
     block_fdsets: HashMap<String, Vec<i64>>,
+
+    // Nova Kata (ADR-052): the guest MAC of each network device on a bridge
+    // (by its frontend id), and, on a migration's destination, the place
+    // each MAC had on the source.
+    network_macs: HashMap<String, String>,
+    network_pins: HashMap<String, (String, i64)>,
 }
 
 // We have to implement Debug since the Hypervisor trait requires it and Qmp
@@ -116,6 +122,8 @@ impl Qmp {
                 ccw_subchannel: None,
                 pci_bridge_devices: HashMap::new(),
                 block_fdsets: HashMap::new(),
+                network_macs: HashMap::new(),
+                network_pins: HashMap::new(),
             };
 
             let info = qmp.qmp.handshake().context("qmp handshake failed")?;
@@ -208,6 +216,90 @@ impl Qmp {
         let migrate_info = self.qmp.execute(&qmp::query_migrate {})?;
 
         Ok(migrate_info)
+    }
+
+    /// Nova Kata (ADR-052): on a migration's destination, the place each
+    /// network device had on the source, by its guest MAC.
+    pub fn set_network_pins(&mut self, pins: HashMap<String, (String, i64)>) {
+        self.network_pins = pins;
+    }
+
+    /// Nova Kata (ADR-052): the network devices on the bridges, by MAC.
+    pub fn migration_networks(&self) -> Vec<crate::migration::NetworkPin> {
+        let mut pins = Vec::new();
+        for (bus, slots) in &self.pci_bridge_devices {
+            for (slot, frontend) in slots {
+                if let Some(mac) = self.network_macs.get(frontend) {
+                    pins.push(crate::migration::NetworkPin {
+                        mac: mac.clone(),
+                        bus: bus.clone(),
+                        slot: *slot,
+                    });
+                }
+            }
+        }
+        pins.sort_by(|a, b| (a.bus.as_str(), a.slot).cmp(&(b.bus.as_str(), b.slot)));
+        pins
+    }
+
+    /// Nova Kata (ADR-052): send the VM to `uri`. QEMU's `migrate` returns
+    /// once the transfer began; query-migrate follows it.
+    pub fn migration_send(
+        &mut self,
+        uri: &str,
+        params: &crate::migration::MigrationParams,
+    ) -> Result<()> {
+        self.qmp
+            .execute(&migrate_set_capabilities {
+                capabilities: vec![MigrationCapabilityStatus {
+                    capability: MigrationCapability::events,
+                    state: true,
+                }],
+            })
+            .context("set the migration's events")?;
+        let mut parameters = qapi_qmp::MigrateSetParameters::default();
+        if params.downtime_ms > 0 {
+            parameters.downtime_limit = Some(params.downtime_ms);
+        }
+        if params.max_bandwidth > 0 {
+            parameters.max_bandwidth = Some(params.max_bandwidth);
+        }
+        self.qmp
+            .execute(&qapi_qmp::migrate_set_parameters(parameters))
+            .context("set the migration's parameters")?;
+        self.execute_migration(uri)
+    }
+
+    pub fn migration_cancel(&mut self) -> Result<()> {
+        self.qmp
+            .execute(&qapi_qmp::migrate_cancel {})
+            .map(|_| ())
+            .context("cancel the migration")
+    }
+
+    /// Nova Kata (ADR-052): query-migrate, as the shim reports it.
+    pub fn migration_progress(&mut self) -> Result<crate::migration::MigrationProgress> {
+        let info = self
+            .qmp
+            .execute(&qmp::query_migrate {})
+            .context("query the migration")?;
+        let status = match info.status {
+            None | Some(MigrationStatus::none) => "none",
+            Some(MigrationStatus::completed) => "completed",
+            Some(MigrationStatus::failed) => "failed",
+            Some(MigrationStatus::cancelled) => "cancelled",
+            Some(_) => "active",
+        };
+        let ram = info.ram.as_ref();
+        let positive = |value: Option<i64>| value.unwrap_or(0).max(0) as u64;
+        Ok(crate::migration::MigrationProgress {
+            status: status.to_string(),
+            transferred: positive(ram.map(|r| r.transferred)),
+            remaining: positive(ram.map(|r| r.remaining)),
+            total_ms: positive(info.total_time),
+            downtime_ms: positive(info.downtime),
+            error: info.error_desc.clone().unwrap_or_default(),
+        })
     }
 
     pub fn execute_migration_incoming(&mut self, uri: &str) -> Result<()> {
@@ -972,7 +1064,22 @@ impl Qmp {
             netdev_frontend_args.insert("devno".to_owned(), devno.into());
             None
         } else {
-            let (bus, slot) = self.find_free_slot()?;
+            let (bus, slot) = match self.network_pins.get(&virtio_net_device.get_mac_addr()) {
+                Some((bus, slot)) => {
+                    let taken = self
+                        .pci_bridge_devices
+                        .get(bus)
+                        .map(|slots| slots.contains_key(slot))
+                        .unwrap_or(true);
+                    if taken {
+                        return Err(anyhow!(
+                            "migration_invalid: the place {bus}/{slot} of a network device is taken"
+                        ));
+                    }
+                    (bus.clone(), *slot)
+                }
+                None => self.find_free_slot()?,
+            };
             netdev_frontend_args.insert("addr".to_owned(), format!("{slot:02}").into());
             // As the golang runtime documents the vectors computation, it's
             // 2N+2 vectors, N for tx queues, N for rx queues, 1 for config,
@@ -1085,18 +1192,24 @@ impl Qmp {
         if let Some((bridge_id, slot)) = pci_hotplug {
             self.record_pci_bridge_slot(&bridge_id, slot, &frontend_id);
         }
+        self.network_macs
+            .insert(frontend_id, virtio_net_device.get_mac_addr());
 
         Ok(())
     }
 
     /// Nova Kata (ADR-044): a network device of the command line holds this
     /// slot of the bridge.
-    pub fn record_network_device(&mut self, bridge_id: &str, slot: i64, host_dev_name: &str) {
-        self.record_pci_bridge_slot(
-            bridge_id,
-            slot,
-            &format!("frontend-network-{host_dev_name}"),
-        );
+    pub fn record_network_device(
+        &mut self,
+        bridge_id: &str,
+        slot: i64,
+        host_dev_name: &str,
+        mac: &str,
+    ) {
+        let frontend = format!("frontend-network-{host_dev_name}");
+        self.record_pci_bridge_slot(bridge_id, slot, &frontend);
+        self.network_macs.insert(frontend, mac.to_ascii_lowercase());
     }
 
     /// Nova Kata (ADR-044): the inverse of hotplug_network_device. The tap
@@ -1122,6 +1235,7 @@ impl Qmp {
         for devices in self.pci_bridge_devices.values_mut() {
             devices.retain(|_, id| id != &frontend_id);
         }
+        self.network_macs.remove(&frontend_id);
         if crate::utils::uses_native_ccw_bus() {
             if let Some(subchannel) = self.ccw_subchannel.as_mut() {
                 let _ = subchannel.remove_device(&frontend_id);
