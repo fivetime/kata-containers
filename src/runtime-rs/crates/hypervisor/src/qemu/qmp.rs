@@ -256,14 +256,23 @@ impl Qmp {
         stream: &std::net::TcpStream,
         params: &crate::migration::MigrationParams,
     ) -> Result<()> {
+        // return-path: the source's transfer completes only once the
+        // destination has loaded the state; one that fails to load it fails
+        // the migration and the source runs on (ADR-052, one writer).
         self.qmp
             .execute(&migrate_set_capabilities {
-                capabilities: vec![MigrationCapabilityStatus {
-                    capability: MigrationCapability::events,
-                    state: true,
-                }],
+                capabilities: vec![
+                    MigrationCapabilityStatus {
+                        capability: MigrationCapability::events,
+                        state: true,
+                    },
+                    MigrationCapabilityStatus {
+                        capability: MigrationCapability::return_path,
+                        state: true,
+                    },
+                ],
             })
-            .context("set the migration's events")?;
+            .context("set the migration's capabilities")?;
         let mut parameters = qapi_qmp::MigrateSetParameters::default();
         if params.downtime_ms > 0 {
             parameters.downtime_limit = Some(params.downtime_ms);
@@ -326,6 +335,15 @@ impl Qmp {
     /// shim accepted in the host's network namespace. QEMU reads an fd it is
     /// given as a connected stream, never as a listener.
     pub fn migration_incoming_stream(&mut self, stream: &std::net::TcpStream) -> Result<()> {
+        // Both ends need return-path, which the source sets too.
+        self.qmp
+            .execute(&migrate_set_capabilities {
+                capabilities: vec![MigrationCapabilityStatus {
+                    capability: MigrationCapability::return_path,
+                    state: true,
+                }],
+            })
+            .context("set the migration's return path")?;
         self.pass_fd(stream.as_raw_fd(), MIGRATION_IN_FD)
             .context("hand the migration's connection to QEMU")?;
         self.execute_migration_incoming(&format!("fd:{MIGRATION_IN_FD}"))

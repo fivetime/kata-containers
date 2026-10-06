@@ -951,6 +951,22 @@ pub fn generate_mount_path(id: &str, file_name: &str) -> String {
     format!("{nid}-{uid}-{file_name}")
 }
 
+/// Nova Kata (ADR-052): the name of a block volume's mount point in the
+/// sandbox's shared directory, the same on both ends of a live migration.
+/// The guest has looked the mount point up through virtio-fs, and
+/// virtiofsd's migrated state names it by its path, which must exist on the
+/// destination. It depends on the sandbox and the mount's destination only;
+/// the shape is generate_mount_path's.
+pub fn stable_mount_path(sid: &str, destination: &str, file_name: &str) -> String {
+    // FNV-1a, 64 bits: fixed for good, unlike std's hasher.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in sid.bytes().chain(std::iter::once(0)).chain(destination.bytes()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{:010x}-{:08x}-{file_name}", hash >> 24, hash as u32)
+}
+
 /// This function is used to check whether a given volume is a watchable volume.
 /// More specifically, it determines whether the volume's path is located under
 /// a predefined list of allowed copy directories.
@@ -990,6 +1006,16 @@ fn generate_copy_file_guest_path(cid: &str, mount_destination: &Path) -> Result<
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn nova_stable_mount_path_is_the_same_for_the_same_mount() {
+        let a = stable_mount_path("nova-x", "/config-drive", "config-drive");
+        assert_eq!(a, stable_mount_path("nova-x", "/config-drive", "config-drive"));
+        assert_ne!(a, stable_mount_path("nova-y", "/config-drive", "config-drive"));
+        assert_ne!(a, stable_mount_path("nova-x", "/dev/sdb", "config-drive"));
+        let parts: Vec<&str> = a.splitn(3, '-').collect();
+        assert_eq!((parts[0].len(), parts[1].len(), parts[2]), (10, 8, "config-drive"));
+    }
 
     #[test]
     fn test_is_system_mount() {

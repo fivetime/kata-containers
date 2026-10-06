@@ -104,7 +104,16 @@ pub(crate) async fn generate_shared_path(
     sid: &str,
 ) -> Result<String> {
     let file_name = get_file_name(&dest).context("failed to get file name.")?;
-    let mount_name = generate_mount_path(device_id, file_name.as_str());
+    // Nova Kata (ADR-052): a name both ends of a live migration give it;
+    // a random one when it is taken, as upstream's always is.
+    let mut mount_name = crate::volume::share_fs_volume::stable_mount_path(
+        sid,
+        &dest.to_string_lossy(),
+        file_name.as_str(),
+    );
+    if std::path::Path::new(&do_get_host_path(&mount_name, sid, device_id, true, false)).exists() {
+        mount_name = generate_mount_path(device_id, file_name.as_str());
+    }
     let guest_path = do_get_guest_path(&mount_name, device_id, true, false);
     // Note: directories should always be created under the rw/ path. The ro/ directory is a
     // read-only bind mount of rw/, so creating directories directly under ro/ would fail with a read-only FS.
