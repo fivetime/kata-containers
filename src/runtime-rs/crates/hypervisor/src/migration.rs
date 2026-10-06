@@ -36,6 +36,12 @@ pub struct NetworkPin {
     pub mac: String,
     pub bus: String,
     pub slot: i64,
+    /// Modern (transitional) virtio, as a hot-plugged NIC is; a cold-plugged
+    /// one is legacy (disable-modern) where the configuration says so. The
+    /// PCI configuration of the two differs, and the state of one does not
+    /// load into the other.
+    #[serde(default)]
+    pub modern: bool,
 }
 
 /// The devices of a running sandbox, as its VMM has them. The source

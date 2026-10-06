@@ -94,14 +94,14 @@ impl QemuInner {
         self.incoming = incoming;
     }
 
-    fn network_pins(&self) -> HashMap<String, (String, i64)> {
+    fn network_pins(&self) -> HashMap<String, (String, i64, bool)> {
         self.incoming
             .as_ref()
             .map(|incoming| {
                 incoming
                     .networks
                     .iter()
-                    .map(|pin| (pin.mac.clone(), (pin.bus.clone(), pin.slot)))
+                    .map(|pin| (pin.mac.clone(), (pin.bus.clone(), pin.slot, pin.modern)))
                     .collect()
             })
             .unwrap_or_default()
@@ -624,9 +624,12 @@ impl QemuInner {
                             .as_ref()
                             .map(|mac| format!("{mac:?}"))
                             .unwrap_or_default();
-                        let place = match pins.get(&mac) {
-                            Some(place) => Some(place.clone()),
-                            None => boot_network_slot(&self.config, index),
+                        let (place, modern) = match pins.get(&mac) {
+                            Some((bus, slot, modern)) => (Some((bus.clone(), *slot)), *modern),
+                            None => (
+                                boot_network_slot(&self.config, index),
+                                !super::cmdline_generator::cold_plug_disables_modern(),
+                            ),
                         };
                         if let Some((bridge, slot)) = place {
                             qmp.record_network_device(
@@ -634,6 +637,7 @@ impl QemuInner {
                                 slot,
                                 &network.config.host_dev_name,
                                 &mac,
+                                modern,
                             );
                         }
                         index += 1;

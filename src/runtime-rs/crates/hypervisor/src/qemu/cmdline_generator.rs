@@ -2974,6 +2974,11 @@ fn is_running_in_vm() -> Result<bool> {
     Ok(res)
 }
 
+/// Whether a cold-plugged NIC of this host is legacy virtio.
+pub(crate) fn cold_plug_disables_modern() -> bool {
+    should_disable_modern()
+}
+
 fn should_disable_modern() -> bool {
     if !bus_type().supports_disable_modern() {
         return false;
@@ -3026,7 +3031,7 @@ pub struct QemuCmdLine<'a> {
     network_devices: usize,
     // Nova Kata (ADR-052): the place each guest MAC had on a migration's
     // source.
-    network_pins: HashMap<String, (String, i64)>,
+    network_pins: HashMap<String, (String, i64, bool)>,
 }
 
 impl<'a> QemuCmdLine<'a> {
@@ -3157,7 +3162,7 @@ impl<'a> QemuCmdLine<'a> {
         self.devices.push(Box::new(Incoming {}));
     }
 
-    pub fn set_network_pins(&mut self, pins: HashMap<String, (String, i64)>) {
+    pub fn set_network_pins(&mut self, pins: HashMap<String, (String, i64, bool)>) {
         self.network_pins = pins;
     }
 
@@ -3486,7 +3491,11 @@ impl<'a> QemuCmdLine<'a> {
             num_queues,
         )?;
         let place = match self.network_pins.get(&mac) {
-            Some(place) => Some(place.clone()),
+            Some((bus, slot, modern)) => {
+                // As the source had it: a hot-plugged NIC is modern virtio.
+                virtio_net_device.set_disable_modern(!modern);
+                Some((bus.clone(), *slot))
+            }
             None => boot_network_slot(self.config, self.network_devices),
         };
         virtio_net_device.set_pci_slot(place);

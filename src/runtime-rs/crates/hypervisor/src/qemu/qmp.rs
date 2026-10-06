@@ -97,7 +97,9 @@ pub struct Qmp {
     // (by its frontend id), and, on a migration's destination, the place
     // each MAC had on the source.
     network_macs: HashMap<String, String>,
-    network_pins: HashMap<String, (String, i64)>,
+    /// Nova Kata (ADR-052): by frontend id, whether the NIC is modern virtio.
+    network_modern: HashMap<String, bool>,
+    network_pins: HashMap<String, (String, i64, bool)>,
 }
 
 // We have to implement Debug since the Hypervisor trait requires it and Qmp
@@ -128,6 +130,7 @@ impl Qmp {
                 pci_bridge_devices: HashMap::new(),
                 block_fdsets: HashMap::new(),
                 network_macs: HashMap::new(),
+                network_modern: HashMap::new(),
                 network_pins: HashMap::new(),
             };
 
@@ -225,7 +228,7 @@ impl Qmp {
 
     /// Nova Kata (ADR-052): on a migration's destination, the place each
     /// network device had on the source, by its guest MAC.
-    pub fn set_network_pins(&mut self, pins: HashMap<String, (String, i64)>) {
+    pub fn set_network_pins(&mut self, pins: HashMap<String, (String, i64, bool)>) {
         self.network_pins = pins;
     }
 
@@ -239,6 +242,7 @@ impl Qmp {
                         mac: mac.clone(),
                         bus: bus.clone(),
                         slot: *slot,
+                        modern: self.network_modern.get(frontend).copied().unwrap_or(true),
                     });
                 }
             }
@@ -1101,7 +1105,7 @@ impl Qmp {
             None
         } else {
             let (bus, slot) = match self.network_pins.get(&virtio_net_device.get_mac_addr()) {
-                Some((bus, slot)) => {
+                Some((bus, slot, _modern)) => {
                     let taken = self
                         .pci_bridge_devices
                         .get(bus)
@@ -1229,7 +1233,9 @@ impl Qmp {
             self.record_pci_bridge_slot(&bridge_id, slot, &frontend_id);
         }
         self.network_macs
-            .insert(frontend_id, virtio_net_device.get_mac_addr());
+            .insert(frontend_id.clone(), virtio_net_device.get_mac_addr());
+        // Hot-plugged as modern virtio, above.
+        self.network_modern.insert(frontend_id, true);
 
         Ok(())
     }
@@ -1242,10 +1248,13 @@ impl Qmp {
         slot: i64,
         host_dev_name: &str,
         mac: &str,
+        modern: bool,
     ) {
         let frontend = format!("frontend-network-{host_dev_name}");
         self.record_pci_bridge_slot(bridge_id, slot, &frontend);
-        self.network_macs.insert(frontend, mac.to_ascii_lowercase());
+        self.network_macs
+            .insert(frontend.clone(), mac.to_ascii_lowercase());
+        self.network_modern.insert(frontend, modern);
     }
 
     /// Nova Kata (ADR-044): the inverse of hotplug_network_device. The tap
