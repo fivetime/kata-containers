@@ -162,6 +162,9 @@ struct MigrationState {
     finished: bool,
     /// The sandbox sends its VM.
     sending: bool,
+    /// Nova's force-complete stopped the VM's vCPUs for the transfer to end;
+    /// a transfer that fails resumes them.
+    forced: bool,
 }
 
 /// How long a destination waits, once told to finish, for its VMM to have
@@ -770,14 +773,24 @@ impl VirtSandbox {
         loop {
             match self.hypervisor.migration_progress().await {
                 Ok(progress) => {
+                    if progress.ended() && progress.status != "completed" {
+                        // The VM runs on here: one stopped for a forced
+                        // completion runs again before the end is told.
+                        let mut state = self.migration.lock().await;
+                        if state.forced {
+                            if let Err(err) = self.hypervisor.resume_vm().await {
+                                error!(sl!(), "resume the VM after its migration: {:?}", err);
+                            }
+                            state.forced = false;
+                        }
+                        state.sending = false;
+                        drop(state);
+                        self.monitor.resume();
+                    }
                     if let Err(err) = crate::live_migration::write_json(&path, &progress) {
                         warn!(sl!(), "write the migration's status: {:?}", err);
                     }
                     if progress.ended() {
-                        if progress.status != "completed" {
-                            self.monitor.resume();
-                            self.migration.lock().await.sending = false;
-                        }
                         info!(sl!(), "migration of {} ended: {}", self.sid, progress.status);
                         return;
                     }
@@ -1192,6 +1205,19 @@ impl Sandbox for VirtSandbox {
                     return Err(anyhow!("migration_invalid: no migration is under way"));
                 }
                 self.hypervisor.migration_cancel().await?;
+            }
+            "pause" => {
+                // Nova's force-complete, as libvirt's: the VM, not its
+                // workload, stops, so that nothing frozen reaches the
+                // destination; the last copy follows at once.
+                let mut state = self.migration.lock().await;
+                if !state.sending {
+                    return Err(anyhow!("migration_invalid: no migration is under way"));
+                }
+                if !state.forced {
+                    self.hypervisor.pause_vm().await.context("stop the VM's vCPUs")?;
+                    state.forced = true;
+                }
             }
             _ => return Err(anyhow!("migration_unsupported: action")),
         }

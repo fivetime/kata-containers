@@ -104,13 +104,13 @@ pub fn parse(req: &UpdateRequest) -> Result<Option<MigrationUpdate>> {
             validate_path(&req.container_id, value.path.as_deref().unwrap_or(""))?;
             hypervisor::migration::validate_tcp_uri(value.uri.as_deref().unwrap_or(""))?;
         }
-        "cancel" => {
+        "cancel" | "pause" => {
             if value.path.is_some()
                 || value.uri.is_some()
                 || value.downtime_ms.is_some()
                 || value.max_bandwidth.is_some()
             {
-                bail!("migration_invalid: a cancel names nothing");
+                bail!("migration_invalid: a cancel or a pause names nothing");
             }
         }
         _ => bail!("migration_unsupported: action"),
@@ -190,6 +190,8 @@ mod tests {
         assert!(parse(&request(&manifest)).unwrap().is_some());
         let cancel = format!(r#"{{"action":"cancel","generation":"g","request_id":"{REQ}"}}"#);
         assert!(parse(&request(&cancel)).unwrap().is_some());
+        let pause = format!(r#"{{"action":"pause","generation":"g","request_id":"{REQ}"}}"#);
+        assert_eq!(parse(&request(&pause)).unwrap().unwrap().action, "pause");
     }
 
     #[test]
