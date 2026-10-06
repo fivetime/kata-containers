@@ -64,6 +64,10 @@ pub struct MigrateIn {
     pub blocks: Vec<BlockPin>,
     #[serde(default)]
     pub networks: Vec<NetworkPin>,
+    /// The source's container is paused (its workload frozen in the guest,
+    /// which the transfer carries): it is adopted as paused.
+    #[serde(default)]
+    pub paused: bool,
 }
 
 impl MigrateIn {

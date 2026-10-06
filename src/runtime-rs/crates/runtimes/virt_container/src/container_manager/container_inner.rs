@@ -161,11 +161,18 @@ impl ContainerInner {
 
     /// Nova Kata (ADR-052): the container runs in a guest that arrived by
     /// a live migration; it is taken over, not started.
-    pub(crate) async fn adopt_container(&mut self) -> Result<()> {
+    pub(crate) async fn adopt_container(&mut self, paused: bool) -> Result<()> {
         self.check_state(vec![ProcessStatus::Created])
             .await
             .context("check state")?;
-        self.set_state(ProcessStatus::Running).await;
+        // The guest arrived with the container as the source had it; the
+        // agent in it knows the container as such too.
+        self.set_state(if paused {
+            ProcessStatus::Paused
+        } else {
+            ProcessStatus::Running
+        })
+        .await;
         Ok(())
     }
 

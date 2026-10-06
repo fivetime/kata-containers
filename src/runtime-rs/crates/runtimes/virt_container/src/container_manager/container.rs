@@ -349,8 +349,8 @@ impl Container {
         match process.process_type {
             ProcessType::Container => {
                 let res: Result<()> = async {
-                    if migrated_in(&self.spec) {
-                        inner.adopt_container().await?;
+                    if let Some(incoming) = migrated_in_as(&self.spec)? {
+                        inner.adopt_container(incoming.paused).await?;
                     } else {
                         inner.start_container(&process.container_id).await?;
                     }
@@ -1566,4 +1566,12 @@ fn migrated_in(spec: &oci::Spec) -> bool {
         .as_ref()
         .map(|annotations| annotations.contains_key(hypervisor::migration::MIGRATE_IN_KEY))
         .unwrap_or(false)
+}
+
+/// The migrate-in request of the spec, if any.
+fn migrated_in_as(spec: &oci::Spec) -> Result<Option<hypervisor::migration::MigrateIn>> {
+    match spec.annotations() {
+        Some(annotations) => hypervisor::migration::migrate_in(annotations),
+        None => Ok(None),
+    }
 }
