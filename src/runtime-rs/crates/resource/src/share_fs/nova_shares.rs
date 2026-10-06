@@ -47,6 +47,11 @@ pub const SHARES_KEY: &str = "io.katacontainers.shares.v1";
 const SHARES_PREFIX: &str = "io.katacontainers.shares.";
 const MAX_TEXT: usize = 65536;
 const MAX_SHARES: usize = 32;
+// The RLIMIT_NOFILE of a share's virtiofsd, the gateway's part of the
+// instance's budget: every file the guest has open on the share is a host
+// file handle, which reaches the neighbours.
+const MIN_MAX_FILES: u64 = 256;
+const MAX_MAX_FILES: u64 = 1 << 20;
 /// The tag field of the virtio-fs device configuration is 36 bytes.
 const MAX_TAG: usize = 36;
 /// sun_path holds 108 bytes including the terminating NUL.
@@ -58,6 +63,7 @@ const READY_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct NovaShare {
     pub tag: String,
     pub source: String,
+    pub max_files: u64,
 }
 
 #[derive(Deserialize)]
@@ -65,6 +71,7 @@ pub struct NovaShare {
 struct Entry {
     tag: String,
     source: String,
+    max_files: u64,
 }
 
 /// Parse and audit the share request of a sandbox container's annotations.
@@ -100,9 +107,13 @@ pub fn parse(annotations: &HashMap<String, String>) -> Result<Vec<NovaShare>> {
         if !sources.insert(entry.source.clone()) {
             bail!("share_invalid: duplicate source {:?}", entry.source);
         }
+        if !(MIN_MAX_FILES..=MAX_MAX_FILES).contains(&entry.max_files) {
+            bail!("share_invalid: max_files {} out of range", entry.max_files);
+        }
         shares.push(NovaShare {
             tag: entry.tag,
             source: entry.source,
+            max_files: entry.max_files,
         });
     }
     Ok(shares)
@@ -220,17 +231,31 @@ pub(crate) fn share_socket_path(jailer_root: &str, index: usize) -> Result<Strin
 }
 
 /// virtiofsd arguments of one share: those of the sandbox daemon plus an
-/// explicit namespace sandbox and a killing seccomp filter.
+/// explicit namespace sandbox, a killing seccomp filter and the share's
+/// file limit, which replaces one the sandbox daemon's arguments set.
 pub(crate) fn share_virtiofsd_args(
     sock_path: &str,
     source: &str,
+    max_files: u64,
     config: &HypervisorConfig,
 ) -> Vec<String> {
+    let mut extra = Vec::with_capacity(config.shared_fs.virtio_fs_extra_args.len());
+    let mut skip = false;
+    for arg in &config.shared_fs.virtio_fs_extra_args {
+        if std::mem::take(&mut skip) {
+            continue;
+        }
+        if arg == "--rlimit-nofile" {
+            skip = true;
+        } else if !arg.starts_with("--rlimit-nofile=") {
+            extra.push(arg.clone());
+        }
+    }
     let mut args = virtiofsd_base_args(
         sock_path,
         source,
         &config.shared_fs.virtio_fs_cache,
-        &config.shared_fs.virtio_fs_extra_args,
+        &extra,
         config.disable_guest_selinux,
     );
     args.extend(
@@ -238,6 +263,7 @@ pub(crate) fn share_virtiofsd_args(
             .iter()
             .map(|arg| arg.to_string()),
     );
+    args.push(format!("--rlimit-nofile={}", max_files));
     args
 }
 
@@ -312,7 +338,7 @@ impl NovaShareDaemons {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error).context("inspect share socket path"),
             }
-            let args = share_virtiofsd_args(&sock_path, &share.source, config);
+            let args = share_virtiofsd_args(&sock_path, &share.source, share.max_files, config);
             let child = Command::new(&config.shared_fs.virtio_fs_daemon)
                 .args(&args)
                 .stderr(Stdio::piped())
@@ -394,7 +420,7 @@ mod tests {
     }
 
     fn entry(tag: &str, source: &str) -> serde_json::Value {
-        serde_json::json!({"tag": tag, "source": source})
+        serde_json::json!({"tag": tag, "source": source, "max_files": 4096})
     }
 
     fn list(entries: &[serde_json::Value]) -> HashMap<String, String> {
@@ -437,11 +463,28 @@ mod tests {
             vec![
                 NovaShare {
                     tag: "share-1".into(),
-                    source: a
+                    source: a,
+                    max_files: 4096
                 },
-                NovaShare { tag, source: b },
+                NovaShare {
+                    tag,
+                    source: b,
+                    max_files: 4096
+                },
             ]
         );
+    }
+
+    #[test]
+    fn nova_shares_refuses_a_share_without_its_file_limit() {
+        let (_dir, a, _) = dirs();
+        for value in [
+            serde_json::json!({"tag": "t", "source": a}),
+            serde_json::json!({"tag": "t", "source": a, "max_files": 255}),
+            serde_json::json!({"tag": "t", "source": a, "max_files": (1u64 << 20) + 1}),
+        ] {
+            assert!(refused(&list(&[value])).starts_with("share_invalid:"));
+        }
     }
 
     #[test]
@@ -551,7 +594,7 @@ mod tests {
         let sock = share_socket_path(&root, 31).unwrap();
         assert!(sock.starts_with(&root) && sock.contains(sid), "{}", sock);
         let mut config = config("/opt/kata/libexec/virtiofsd");
-        let args = share_virtiofsd_args(&sock, "/srv/share", &config);
+        let args = share_virtiofsd_args(&sock, "/srv/share", 4096, &config);
         let pairs = |args: &[String], flag: &str, value: &str| {
             args.windows(2).any(|w| w[0] == flag && w[1] == value)
         };
@@ -563,8 +606,22 @@ mod tests {
         assert!(pairs(&args, "-o", "announce_submounts"));
         assert!(args.contains(&"--thread-pool-size=1".to_string()));
         assert!(args.contains(&"--xattr".to_string()));
+        assert_eq!(args.last().unwrap(), "--rlimit-nofile=4096");
+        // The sandbox daemon's own limit is not the share's.
+        for own in [
+            vec!["--rlimit-nofile=65536".to_string()],
+            vec!["--rlimit-nofile".to_string(), "65536".to_string()],
+        ] {
+            let mut limited = config.clone();
+            limited.shared_fs.virtio_fs_extra_args.extend(own);
+            let args = share_virtiofsd_args(&sock, "/srv/share", 4096, &limited);
+            let limits: Vec<_> = args.iter().filter(|a| a.contains("rlimit")).collect();
+            assert_eq!(limits, vec!["--rlimit-nofile=4096"]);
+            assert!(!args.contains(&"65536".to_string()));
+            assert!(args.contains(&"--thread-pool-size=1".to_string()));
+        }
         config.disable_guest_selinux = true;
-        let args = share_virtiofsd_args(&sock, "/srv/share", &config);
+        let args = share_virtiofsd_args(&sock, "/srv/share", 4096, &config);
         assert!(!args.contains(&"--xattr".to_string()));
         let long = format!("/{}", "x".repeat(100));
         assert!(share_socket_path(&long, 0).is_err());
@@ -575,6 +632,7 @@ mod tests {
         let share = NovaShare {
             tag: "t".into(),
             source: "/srv/share".into(),
+            max_files: 4096,
         };
         let cfg = share_fs_config(&share, "/run/kata/s/root/virtiofsd-share-0.sock", 1024);
         assert_eq!(cfg.fs_type, "virtio-fs");
