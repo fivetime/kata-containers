@@ -94,6 +94,11 @@ fn canonical_mac(value: &str) -> bool {
 /// A listening URI: `tcp:` an address (IPv4, or IPv6 in brackets) and a
 /// port that is not 0.
 pub fn validate_tcp_uri(uri: &str) -> Result<()> {
+    tcp_address(uri).map(|_| ())
+}
+
+/// The address of a `tcp:<IP>:<port>` URI.
+pub fn tcp_address(uri: &str) -> Result<std::net::SocketAddr> {
     let rest = uri
         .strip_prefix("tcp:")
         .context("migration_invalid: the URI is not tcp:")?;
@@ -108,9 +113,10 @@ pub fn validate_tcp_uri(uri: &str) -> Result<()> {
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
-    host.parse::<std::net::IpAddr>()
+    let ip = host
+        .parse::<std::net::IpAddr>()
         .context("migration_invalid: the URI's address is not an IP address")?;
-    Ok(())
+    Ok(std::net::SocketAddr::new(ip, port))
 }
 
 fn validate_pins(blocks: &[BlockPin], networks: &[NetworkPin]) -> Result<()> {

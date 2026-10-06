@@ -28,6 +28,11 @@ use std::fmt::{Debug, Error, Formatter};
 use std::io::BufReader;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
+
+// Nova Kata (ADR-052): the names under which the shim hands QEMU the
+// migration's sockets (QMP getfd).
+const MIGRATION_OUT_FD: &str = "nova-migration-out";
+const MIGRATION_IN_FD: &str = "nova-migration-in";
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -242,11 +247,13 @@ impl Qmp {
         pins
     }
 
-    /// Nova Kata (ADR-052): send the VM to `uri`. QEMU's `migrate` returns
-    /// once the transfer began; query-migrate follows it.
+    /// Nova Kata (ADR-052): send the VM over `stream`, which the shim
+    /// connected in the host's network namespace: QEMU runs in the
+    /// sandbox's, which has no route to the migration network. QEMU's
+    /// `migrate` returns once the transfer began; query-migrate follows it.
     pub fn migration_send(
         &mut self,
-        uri: &str,
+        stream: &std::net::TcpStream,
         params: &crate::migration::MigrationParams,
     ) -> Result<()> {
         self.qmp
@@ -267,7 +274,9 @@ impl Qmp {
         self.qmp
             .execute(&qapi_qmp::migrate_set_parameters(parameters))
             .context("set the migration's parameters")?;
-        self.execute_migration(uri)
+        self.pass_fd(stream.as_raw_fd(), MIGRATION_OUT_FD)
+            .context("hand the migration's connection to QEMU")?;
+        self.execute_migration(&format!("fd:{MIGRATION_OUT_FD}"))
     }
 
     pub fn migration_cancel(&mut self) -> Result<()> {
@@ -311,6 +320,15 @@ impl Qmp {
             })
             .map(|_| ())
             .context("execute migration incoming")
+    }
+
+    /// Nova Kata (ADR-052): receive the VM over `stream`, a connection the
+    /// shim accepted in the host's network namespace. QEMU reads an fd it is
+    /// given as a connected stream, never as a listener.
+    pub fn migration_incoming_stream(&mut self, stream: &std::net::TcpStream) -> Result<()> {
+        self.pass_fd(stream.as_raw_fd(), MIGRATION_IN_FD)
+            .context("hand the migration's connection to QEMU")?;
+        self.execute_migration_incoming(&format!("fd:{MIGRATION_IN_FD}"))
     }
 
     pub fn hotplug_vcpus(&mut self, vcpu_cnt: u32) -> Result<u32> {

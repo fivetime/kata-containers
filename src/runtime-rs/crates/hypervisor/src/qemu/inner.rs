@@ -112,11 +112,19 @@ impl QemuInner {
         uri: &str,
         params: &crate::migration::MigrationParams,
     ) -> Result<()> {
-        crate::migration::validate_tcp_uri(uri)?;
-        self.qmp
+        let address = crate::migration::tcp_address(uri)?;
+        let qmp = self
+            .qmp
             .as_mut()
-            .context("migration_unsupported: QMP is not connected")?
-            .migration_send(uri, params)
+            .context("migration_unsupported: QMP is not connected")?;
+        // The shim runs in the host's network namespace, QEMU in the
+        // sandbox's: the shim connects, QEMU gets the connection.
+        let stream = std::net::TcpStream::connect_timeout(
+            &address,
+            std::time::Duration::from_secs(10),
+        )
+        .with_context(|| format!("migration_failed: connect to {address}"))?;
+        qmp.migration_send(&stream, params)
     }
 
     pub(crate) fn migration_progress(&mut self) -> Result<crate::migration::MigrationProgress> {
@@ -133,17 +141,25 @@ impl QemuInner {
             .migration_cancel()
     }
 
-    pub(crate) fn migration_receive(&mut self) -> Result<()> {
-        let uri = self
+    /// The listener of the migration this VM receives, bound in the host's
+    /// network namespace, where the shim runs; QEMU runs in the sandbox's.
+    pub(crate) fn migration_listen(&self) -> Result<std::net::TcpListener> {
+        let uri = &self
             .incoming
             .as_ref()
             .context("migration_invalid: this VM does not receive a migration")?
-            .uri
-            .clone();
+            .uri;
+        let address = crate::migration::tcp_address(uri)?;
+        std::net::TcpListener::bind(address)
+            .with_context(|| format!("migration_failed: listen on {address}"))
+    }
+
+    /// The source connected: QEMU receives the VM over the connection.
+    pub(crate) fn migration_accepted(&mut self, stream: &std::net::TcpStream) -> Result<()> {
         self.qmp
             .as_mut()
             .context("migration_unsupported: QMP is not connected")?
-            .execute_migration_incoming(&uri)
+            .migration_incoming_stream(stream)
     }
 
     pub(crate) fn migration_networks(&self) -> Result<Vec<crate::migration::NetworkPin>> {

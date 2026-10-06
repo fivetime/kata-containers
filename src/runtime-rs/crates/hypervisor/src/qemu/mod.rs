@@ -25,6 +25,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::sync::{mpsc, Mutex};
 
+// Nova Kata (ADR-052): how long a destination waits for its source.
+const MIGRATION_ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 #[derive(Debug)]
 pub struct Qemu {
     inner: Arc<RwLock<QemuInner>>,
@@ -149,8 +152,47 @@ impl Hypervisor for Qemu {
     async fn migration_cancel(&self) -> Result<()> {
         self.inner.write().await.migration_cancel()
     }
+    /// Bind the migration's listener now, so that a port in use fails the
+    /// create; accept the source's connection when it comes, in a task, and
+    /// give it to QEMU, which waits in `-incoming defer`. A source that
+    /// never connects leaves the VM waiting until the destination's
+    /// rollback deletes it.
     async fn migration_receive(&self) -> Result<()> {
-        self.inner.write().await.migration_receive()
+        let listener = self.inner.read().await.migration_listen()?;
+        listener
+            .set_nonblocking(true)
+            .context("migration_failed: the listener")?;
+        let listener =
+            tokio::net::TcpListener::from_std(listener).context("migration_failed: the listener")?;
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            let accepted =
+                tokio::time::timeout(MIGRATION_ACCEPT_TIMEOUT, listener.accept()).await;
+            drop(listener);
+            let (stream, peer) = match accepted {
+                Ok(Ok(accepted)) => accepted,
+                Ok(Err(error)) => {
+                    error!(sl!(), "the migration's connection was not accepted: {:?}", error);
+                    return;
+                }
+                Err(_) => {
+                    warn!(sl!(), "no migration connected within {:?}", MIGRATION_ACCEPT_TIMEOUT);
+                    return;
+                }
+            };
+            info!(sl!(), "the migration connected from {}", peer);
+            let stream = match stream.into_std() {
+                Ok(stream) => stream,
+                Err(error) => {
+                    error!(sl!(), "the migration's connection: {:?}", error);
+                    return;
+                }
+            };
+            if let Err(error) = inner.write().await.migration_accepted(&stream) {
+                error!(sl!(), "QEMU did not take the migration's connection: {:?}", error);
+            }
+        });
+        Ok(())
     }
     async fn migration_networks(&self) -> Result<Vec<crate::migration::NetworkPin>> {
         self.inner.read().await.migration_networks()
