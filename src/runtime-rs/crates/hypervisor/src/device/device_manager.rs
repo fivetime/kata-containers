@@ -358,11 +358,17 @@ impl DeviceManager {
     /// and index, for a migration's manifest; the guest image (a pmem
     /// device) is the profile's own and is not listed.
     pub async fn migration_blocks(&self) -> Vec<crate::migration::BlockPin> {
+        // The guest's own image is the VMM's, the same on every host: a
+        // QEMU NVDIMM, a Cloud Hypervisor disk. It is none of the instance's.
+        let boot = self.hypervisor.hypervisor_config().await.boot_info;
         let mut pins = Vec::new();
         for device in self.devices.values() {
             if let DeviceType::BlockModern(block) = device.lock().await.get_device_info().await {
                 let config = block.lock().await.config.clone();
-                if config.driver_option == *KATA_NVDIMM_DEV_TYPE {
+                if config.driver_option == *KATA_NVDIMM_DEV_TYPE
+                    || (!boot.image.is_empty() && config.path_on_host == boot.image)
+                    || (!boot.initrd.is_empty() && config.path_on_host == boot.initrd)
+                {
                     continue;
                 }
                 pins.push(crate::migration::BlockPin {

@@ -150,38 +150,45 @@ impl Container {
             None => return Err(anyhow!("spec miss root field")),
         };
 
-        // handler rootfs
-        let rootfs = self
-            .resource_manager
-            .handler_rootfs(
-                &config.container_id,
-                root,
-                &config.bundle,
-                &config.rootfs_mounts,
-                &updated_annotations,
-            )
-            .await
-            .context("handler rootfs")?;
-
-        // update rootfs
-        root.set_path(
-            rootfs
-                .get_guest_rootfs_path()
-                .await
-                .context("get guest rootfs path")?
-                .into(),
-        );
-
-        let mut storages = vec![];
-        if let Some(mut storage_list) = rootfs.get_storage().await {
-            storages.append(&mut storage_list);
-        }
-        inner.rootfs.push(rootfs);
-
         // Nova Kata (ADR-052): the container of a guest that arrives by a
         // live migration runs in it already: its devices are placed on the
-        // host as on the source, and nothing is said to its agent.
+        // host as on the source, and nothing is said to its agent. A VMM
+        // that receives its devices with the VM (Cloud Hypervisor) takes
+        // none from the host's handlers: the guest has them already.
         let migrated_in = migrated_in(&self.spec);
+        let receives_devices = migrated_in
+            && toml_config.runtime.hypervisor_name
+                == kata_types::config::hypervisor::HYPERVISOR_NAME_CH;
+
+        let mut storages = vec![];
+        if !receives_devices {
+            // handler rootfs
+            let rootfs = self
+                .resource_manager
+                .handler_rootfs(
+                    &config.container_id,
+                    root,
+                    &config.bundle,
+                    &config.rootfs_mounts,
+                    &updated_annotations,
+                )
+                .await
+                .context("handler rootfs")?;
+
+            // update rootfs
+            root.set_path(
+                rootfs
+                    .get_guest_rootfs_path()
+                    .await
+                    .context("get guest rootfs path")?
+                    .into(),
+            );
+
+            if let Some(mut storage_list) = rootfs.get_storage().await {
+                storages.append(&mut storage_list);
+            }
+            inner.rootfs.push(rootfs);
+        }
         let initial = super::live_volume_created::parse_initial(&config.container_id, &self.spec)?;
         if !initial.is_empty() && !migrated_in {
             let details = self.agent.get_guest_details(agent::GetGuestDetailsRequest::default()).await?;
@@ -191,11 +198,14 @@ impl Container {
         }
         let initial = super::live_volume_created::audit_initial(initial)?;
         // handler volumes
-        let volumes = self
-            .resource_manager
-            .handler_volumes(&config.container_id, &spec)
-            .await
-            .context("handler volumes")?;
+        let volumes = if receives_devices {
+            vec![]
+        } else {
+            self.resource_manager
+                .handler_volumes(&config.container_id, &spec)
+                .await
+                .context("handler volumes")?
+        };
         inner.volumes.extend(volumes.iter().cloned());
         let created = super::live_volume_created::bind_initial(initial, &volumes)?;
         let mut oci_mounts = vec![];
@@ -220,10 +230,13 @@ impl Container {
             .as_ref()
             .context("OCI spec missing linux field")?;
 
-        let container_devices = self
-            .resource_manager
-            .handler_devices(&config.container_id, linux)
-            .await?;
+        let container_devices = if receives_devices {
+            vec![]
+        } else {
+            self.resource_manager
+                .handler_devices(&config.container_id, linux)
+                .await?
+        };
         let mut devices_agent = annotate_container_devices(&mut spec, container_devices)
             .context("annotate container devices failed")?;
         created.apply(&mut spec, &mut devices_agent, &mut inner.live_volumes)?;
