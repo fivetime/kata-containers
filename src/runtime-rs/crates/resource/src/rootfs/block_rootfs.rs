@@ -151,11 +151,13 @@ pub(crate) fn is_block_rootfs(m: &Mount) -> Option<(u64, Mount)> {
         Ok(fstat) => {
             if SFlag::from_bits_truncate(fstat.st_mode) == SFlag::S_IFBLK {
                 let dev_id = fstat.st_rdev;
-                let mut volume = m.clone();
-
-                //clear the volume resource thus the block device will use the dev_id
-                //to find the device's host path;
-                volume.source = String::new();
+                let volume = m.clone();
+                // Nova Kata (ADR-052): the device by the path it was given, not
+                // by the path its device number resolves to. The gateway names
+                // a root by a link that is the same on every host, which a
+                // live migration under Cloud Hypervisor needs: the destination
+                // reopens the devices of the configuration it receives by the
+                // source's paths. The device number still identifies it.
                 return Some((dev_id, volume));
             }
 
