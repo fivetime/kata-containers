@@ -27,6 +27,12 @@ use tokio::sync::{mpsc, Mutex};
 
 // Nova Kata (ADR-052): how long a destination waits for its source.
 const MIGRATION_ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+/// How often the transfer received is asked whether it ended, so that the
+/// VM is resumed the moment it did.
+const MIGRATION_RESUME_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+/// Consecutive queries of the transfer that fail before the watch is given
+/// up: a QEMU that answers no more is gone.
+const MIGRATION_RESUME_FAILURES: u32 = 50;
 
 #[derive(Debug)]
 pub struct Qemu {
@@ -190,6 +196,44 @@ impl Hypervisor for Qemu {
             };
             if let Err(error) = inner.write().await.migration_accepted(&stream) {
                 error!(sl!(), "QEMU did not take the migration's connection: {:?}", error);
+                return;
+            }
+            // Nova Kata (ADR-052): the VM is resumed the moment QEMU reports
+            // the transfer complete, as Cloud Hypervisor resumes its own.
+            // With return-path set at both ends the source's QEMU is stopped
+            // for good by then (postmigrate), so this VM is the one writer;
+            // the finish that Nova's post brings later finds it running.
+            // Waiting for that finish cost the guest the seconds between the
+            // source's record of its release and the destination's reading
+            // of it.
+            let mut failures = 0;
+            loop {
+                tokio::time::sleep(MIGRATION_RESUME_POLL).await;
+                let progress = match inner.write().await.migration_progress() {
+                    Ok(progress) => progress,
+                    Err(error) => {
+                        failures += 1;
+                        if failures >= MIGRATION_RESUME_FAILURES {
+                            warn!(sl!(), "the transfer received cannot be queried: {:?}", error);
+                            return;
+                        }
+                        continue;
+                    }
+                };
+                failures = 0;
+                if progress.status == "completed" {
+                    match inner.write().await.resume_vm() {
+                        Ok(()) => info!(sl!(), "the VM received is resumed at the transfer's end"),
+                        Err(error) => {
+                            error!(sl!(), "the VM received is not resumed: {:?}", error)
+                        }
+                    }
+                    return;
+                }
+                if progress.ended() {
+                    info!(sl!(), "the transfer received ended {}", progress.status);
+                    return;
+                }
             }
         });
         Ok(())
