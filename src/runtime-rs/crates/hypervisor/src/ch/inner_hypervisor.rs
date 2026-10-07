@@ -18,7 +18,7 @@ use crate::MemoryConfig;
 use crate::VM_ROOTFS_DRIVER_BLK;
 use crate::{VcpuThreadIds, VmmState};
 use anyhow::{anyhow, Context, Result};
-use ch_config::ch_api::cloud_hypervisor_vm_netdev_add_with_fds;
+use ch_config::ch_api::cloud_hypervisor_vm_netdev_add;
 use ch_config::{
     ch_api::{
         cloud_hypervisor_vm_create, cloud_hypervisor_vm_info, cloud_hypervisor_vm_pause,
@@ -236,19 +236,12 @@ impl CloudHypervisorInner {
 
         if let Some(network_devices) = network_devices {
             for net in network_devices {
-                let vm_fds = net.fds.clone().unwrap_or_default();
-                let response =
-                    cloud_hypervisor_vm_netdev_add_with_fds(&self.api_socket, net, vm_fds.clone())
-                        .await
-                        .context("failed to add vm netdev with fds")?;
+                let response = cloud_hypervisor_vm_netdev_add(&self.api_socket, net)
+                    .await
+                    .context("failed to add vm netdev")?;
 
                 if let Some(detail) = response {
                     debug!(sl!(), "vm netdev add response: {:?}", detail);
-                }
-
-                for fd in vm_fds {
-                    // Explicitly close the fd now that it has been sent to CLH.
-                    nix::unistd::close(fd).context("failed to close netdev fd")?;
                 }
             }
         }
@@ -795,6 +788,13 @@ impl CloudHypervisorInner {
 
         self.state = VmmState::VmmServerReady;
 
+        if self.incoming.is_some() {
+            // Nova Kata (ADR-052): the VMM receives its VM, configuration
+            // and all, from the source; nothing is created or booted here.
+            info!(sl!(), "the VMM waits for the VM it receives");
+            return Ok(());
+        }
+
         if self.config.vm_template.boot_from_template && self.should_restore_from_template() {
             self.prepare_restore_files()?;
             self.restore_vm().await?;
@@ -823,6 +823,18 @@ impl CloudHypervisorInner {
 
         self.state = VmmState::NotReady;
 
+        if self.vm_left() {
+            // Nova Kata (ADR-052): the VMM ended itself with the VM it
+            // sent; only the log task is left to end.
+            if let Some(tx) = self.shutdown_tx.as_mut() {
+                let _ = tx.send(true);
+            }
+            if let Some(tasks) = self.tasks.take() {
+                let _ = join_all(tasks).await;
+            }
+            return Ok(());
+        }
+
         self.cloud_hypervisor_shutdown().await?;
 
         Ok(())
@@ -834,6 +846,13 @@ impl CloudHypervisorInner {
     }
 
     pub(crate) async fn pause_vm(&self) -> Result<()> {
+        if self.transfer_active() {
+            // Nova Kata (ADR-052): the API is held by the transfer, and
+            // the VMM stops the VM itself for its last copy.
+            return Err(super::migration::unsupported(
+                "cannot stop a VM it is sending; it stops it for the last copy",
+            ));
+        }
         let response = cloud_hypervisor_vm_pause(&self.api_socket).await?;
         if let Some(detail) = response {
             debug!(sl!(), "vm pause response: {:?}", detail);
@@ -841,7 +860,27 @@ impl CloudHypervisorInner {
         Ok(())
     }
 
-    pub(crate) async fn resume_vm(&self) -> Result<()> {
+    pub(crate) async fn resume_vm(&mut self) -> Result<()> {
+        if self.incoming.is_some() {
+            // Nova Kata (ADR-052): the VMM resumed the VM it received
+            // itself, at the transfer's end.
+            let info = cloud_hypervisor_vm_info(&self.api_socket)
+                .await
+                .context("the state of the VM received")?;
+            match info.state {
+                State::Running => {}
+                State::Paused => {
+                    cloud_hypervisor_vm_resume(&self.api_socket)
+                        .await
+                        .context("resume the VM received")?;
+                }
+                other => {
+                    return Err(anyhow!("migration_failed: the VM received is {:?}", other));
+                }
+            }
+            self.state = VmmState::VmRunning;
+            return Ok(());
+        }
         let response = cloud_hypervisor_vm_resume(&self.api_socket).await?;
         if let Some(detail) = response {
             debug!(sl!(), "vm resume response: {:?}", detail);

@@ -78,6 +78,13 @@ pub struct CloudHypervisorInner {
     pub(crate) guest_memory_block_size_mb: u32,
 
     pub(crate) exit_notify: Option<mpsc::Sender<i32>>,
+
+    /// Nova Kata (ADR-052): the migration this VM receives, if any; the
+    /// transfer under way or ended; the bridge a cancel aborts.
+    pub(crate) incoming: Option<crate::migration::MigrateIn>,
+    pub(crate) transfer: Option<super::migration::Transfer>,
+    pub(crate) bridge: Option<tokio::task::AbortHandle>,
+    pub(crate) migration_tasks: Vec<JoinHandle<()>>,
 }
 
 const CH_DEFAULT_TIMEOUT_SECS: u32 = 10;
@@ -119,6 +126,10 @@ impl CloudHypervisorInner {
             guest_protection_to_use: GuestProtection::NoProtection,
             ch_features: None,
             guest_memory_block_size_mb: 0,
+            incoming: None,
+            transfer: None,
+            bridge: None,
+            migration_tasks: vec![],
 
             exit_notify,
         }

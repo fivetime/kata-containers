@@ -26,6 +26,7 @@ macro_rules! sl {
 mod inner;
 mod inner_device;
 mod inner_hypervisor;
+mod migration;
 mod utils;
 
 use inner::CloudHypervisorInner;
@@ -64,10 +65,14 @@ impl Hypervisor for CloudHypervisor {
         &self,
         id: &str,
         netns: Option<String>,
-        _annotations: &HashMap<String, String>,
+        annotations: &HashMap<String, String>,
         selinux_label: Option<String>,
     ) -> Result<()> {
+        // Nova Kata (ADR-052): a malformed migrate-in request fails the
+        // start; the sandbox never boots a fresh VM in its place.
+        let incoming = crate::migration::migrate_in(annotations)?;
         let mut inner = self.inner.write().await;
+        inner.set_incoming(incoming);
         inner.prepare_vm(id, netns, selinux_label).await
     }
 
@@ -97,8 +102,41 @@ impl Hypervisor for CloudHypervisor {
     }
 
     async fn resume_vm(&self) -> Result<()> {
-        let inner = self.inner.write().await;
+        let mut inner = self.inner.write().await;
         inner.resume_vm().await
+    }
+
+    fn supports_live_migration(&self) -> bool {
+        true
+    }
+
+    async fn migration_send(
+        &self,
+        uri: &str,
+        params: &crate::migration::MigrationParams,
+    ) -> Result<()> {
+        let mut inner = self.inner.write().await;
+        inner.migration_send(uri, params).await
+    }
+
+    async fn migration_progress(&self) -> Result<crate::migration::MigrationProgress> {
+        let inner = self.inner.read().await;
+        inner.migration_progress()
+    }
+
+    async fn migration_cancel(&self) -> Result<()> {
+        let mut inner = self.inner.write().await;
+        inner.migration_cancel()
+    }
+
+    async fn migration_receive(&self) -> Result<()> {
+        let mut inner = self.inner.write().await;
+        inner.migration_receive().await
+    }
+
+    async fn migration_networks(&self) -> Result<Vec<crate::migration::NetworkPin>> {
+        let inner = self.inner.read().await;
+        inner.migration_networks()
     }
 
     async fn save_vm(&self) -> Result<()> {

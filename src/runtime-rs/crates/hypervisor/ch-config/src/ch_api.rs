@@ -63,6 +63,61 @@ async fn api_command(
     result
 }
 
+/// A command on a connection of its own, for a call that lasts as long as
+/// a live migration (Nova Kata, ADR-052): the shared connection stays free.
+async fn api_command_on(
+    api_socket_path: &str,
+    method: &'static str,
+    endpoint: &'static str,
+    body: Option<String>,
+) -> Result<Option<String>> {
+    let path = api_socket_path.to_string();
+    task::spawn_blocking(move || -> Result<Option<String>> {
+        let mut socket =
+            UnixStream::connect(&path).with_context(|| format!("connect to {path}"))?;
+        simple_api_full_command_and_response(&mut socket, method, endpoint, body.as_deref())
+            .map_err(|e| anyhow!(e))
+    })
+    .await?
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VmSendMigrationData {
+    pub destination_url: String,
+    pub local: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VmReceiveMigrationData {
+    pub receiver_url: String,
+}
+
+pub async fn cloud_hypervisor_vm_send_migration_on(
+    api_socket_path: &str,
+    data: VmSendMigrationData,
+) -> Result<Option<String>> {
+    let body = serde_json::to_string(&data)?;
+    api_command_on(api_socket_path, "PUT", "vm.send-migration", Some(body)).await
+}
+
+pub async fn cloud_hypervisor_vm_receive_migration_on(
+    api_socket_path: &str,
+    data: VmReceiveMigrationData,
+) -> Result<Option<String>> {
+    let body = serde_json::to_string(&data)?;
+    api_command_on(api_socket_path, "PUT", "vm.receive-migration", Some(body)).await
+}
+
+pub async fn cloud_hypervisor_vm_pause_on(api_socket_path: &str) -> Result<Option<String>> {
+    api_command_on(api_socket_path, "PUT", "vm.pause", None).await
+}
+
+pub async fn cloud_hypervisor_vm_info_on(api_socket_path: &str) -> Result<VmInfo> {
+    let response = api_command_on(api_socket_path, "GET", "vm.info", None).await?;
+    let vm_info = response.ok_or(anyhow!("failed to get vminfo"))?;
+    serde_json::from_str(&vm_info).with_context(|| format!("failed to serde {vm_info}"))
+}
+
 pub async fn cloud_hypervisor_vmm_ping(api_socket: &ApiSocket) -> Result<Option<String>> {
     api_command(api_socket, "GET", "vmm.ping", None, None).await
 }

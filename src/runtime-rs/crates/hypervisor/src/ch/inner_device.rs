@@ -9,7 +9,6 @@ use crate::ch::utils::get_rootless_symlink_sandbox_jailer_root;
 use crate::device::pci_path::PciPath;
 use crate::device::DeviceType;
 use crate::utils::create_dir_all_with_inherit_owner;
-use crate::utils::open_named_tuntap;
 use crate::HybridVsockDevice;
 use crate::NetworkConfig;
 use crate::NetworkDevice;
@@ -24,7 +23,7 @@ use ch_config::ch_api::cloud_hypervisor_vm_device_add;
 use ch_config::ch_api::cloud_hypervisor_vm_info;
 use ch_config::ch_api::{
     cloud_hypervisor_vm_blockdev_add, cloud_hypervisor_vm_device_remove,
-    cloud_hypervisor_vm_fs_add, cloud_hypervisor_vm_netdev_add_with_fds,
+    cloud_hypervisor_vm_fs_add, cloud_hypervisor_vm_netdev_add,
     cloud_hypervisor_vm_vsock_add, PciDeviceInfo, VmRemoveDeviceData,
 };
 use ch_config::convert::DEFAULT_NUM_PCI_SEGMENTS;
@@ -33,14 +32,11 @@ use ch_config::ImageType;
 use ch_config::{
     net_util::MacAddr, DeviceConfig, FsConfig, NetConfig, ProtectionDevConfig, VsockConfig,
 };
-use kata_sys_util::netns::NetnsGuard;
 use kata_types::config::hypervisor::RateLimiterConfig;
 use kata_types::rootless::is_rootless;
 
 use safe_path::scoped_join;
 use std::convert::TryFrom;
-use std::os::fd::AsRawFd;
-use std::os::fd::IntoRawFd;
 use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -340,23 +336,15 @@ impl CloudHypervisorInner {
         let netdev = device.clone();
 
         let mut clh_net_config = NetConfig::try_from(device.config)?;
-        // When using fds to pass the tap device to cloud-hypervisor, tap and id fields should be None
-        clh_net_config.tap = None;
+        // Nova Kata (ADR-052): the tap by its name, as at boot.
+        clh_net_config.tap = Some(netdev.config.host_dev_name.clone());
         clh_net_config.id = None;
+        clh_net_config.fds = None;
         // The `config.num_queues` is a queue *pair* count (1 RX + 1 TX per pair).
         // Convert pairs into the actual queue count.
         clh_net_config.num_queues = netdev.config.queue_num.max(1) * 2;
 
-        let files = open_named_tuntap(
-            &netdev.config.host_dev_name,
-            netdev.config.queue_num.max(1) as u32,
-        )
-        .context("open named tuntap")?;
-
-        let fds = files.iter().map(|f| f.as_raw_fd()).collect();
-
-        let response =
-            cloud_hypervisor_vm_netdev_add_with_fds(&self.api_socket, clh_net_config, fds).await?;
+        let response = cloud_hypervisor_vm_netdev_add(&self.api_socket, clh_net_config).await?;
 
         if let Some(detail) = response {
             debug!(sl!(), "netdev add response: {:?}", detail);
@@ -477,28 +465,20 @@ impl CloudHypervisorInner {
                         self.hypervisor_config().network_info.network_queues as usize;
 
                     let mut net_config = NetConfig::try_from(net_device.config.clone())?;
-                    // When using fds to pass the tap device to cloud-hypervisor, tap and id fields should be None
-                    net_config.tap = None;
+                    // Nova Kata (ADR-052): the tap by its name, which the
+                    // VMM opens in its own network namespace, the sandbox's.
+                    // A tap passed as fds does not live-migrate: the
+                    // destination's VMM reopens the devices from the
+                    // configuration it receives, by name.
+                    net_config.tap = Some(net_device.config.host_dev_name.clone());
                     net_config.id = None;
+                    net_config.fds = None;
 
                     net_config.num_queues = network_queues_pairs * 2;
                     info!(
                         sl!(),
                         "network device queue pairs {:?}", network_queues_pairs
                     );
-
-                    // we need ensure opening network device happens in netns.
-                    let netns = self.netns.clone().unwrap_or_default();
-                    let _netns_guard = NetnsGuard::new(&netns).context("new netns guard")?;
-                    let fds = open_named_tuntap(
-                        &net_device.config.host_dev_name,
-                        network_queues_pairs as u32,
-                    )
-                    .context("open named tuntap")?
-                    .into_iter()
-                    .map(|f| f.into_raw_fd())
-                    .collect();
-                    net_config.fds = Some(fds);
                     network_devices.push(net_config);
                 }
                 DeviceType::Vfio(vfio_device) => {
