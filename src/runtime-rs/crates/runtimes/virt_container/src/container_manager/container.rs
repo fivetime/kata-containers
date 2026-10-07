@@ -189,7 +189,13 @@ impl Container {
             }
             inner.rootfs.push(rootfs);
         }
-        let initial = super::live_volume_created::parse_initial(&config.container_id, &self.spec)?;
+        // The volumes the guest arrives with are in the VMM's configuration
+        // too (receives_devices): none is bound here.
+        let initial = if receives_devices {
+            Vec::new()
+        } else {
+            super::live_volume_created::parse_initial(&config.container_id, &self.spec)?
+        };
         if !initial.is_empty() && !migrated_in {
             let details = self.agent.get_guest_details(agent::GetGuestDetailsRequest::default()).await?;
             let dm = self.resource_manager.get_device_manager().await;
@@ -1289,7 +1295,7 @@ impl Container {
         }
         let metadata = resource::volume::direct_volumes::volume_mount_info(&request.source)?;
         validate_metadata(&request, &metadata)?;
-        let host = std::fs::symlink_metadata(&metadata.device)?;
+        let host = std::fs::metadata(&metadata.device)?;
         let number = format!("{}:{}", libc::major(host.rdev()), libc::minor(host.rdev()));
         if !host.file_type().is_block_device()
             || metadata.metadata.get("openstack.device_number") != Some(&number) {
@@ -1387,7 +1393,7 @@ impl Container {
             if serde_json::to_value(&metadata)? != inner.live_volumes[&attach_id].metadata_identity {
                 return Err(anyhow!("volume_update_conflict: detach metadata changed"));
             }
-            let host = std::fs::symlink_metadata(&metadata.device)?;
+            let host = std::fs::metadata(&metadata.device)?;
             if !host.file_type().is_block_device() || metadata.metadata.get("openstack.device_number")
                 != Some(&format!("{}:{}", libc::major(host.rdev()), libc::minor(host.rdev()))) {
                 return Err(anyhow!("volume_update_conflict: detach host device changed"));
@@ -1515,7 +1521,7 @@ impl Container {
         if serde_json::to_value(&metadata)? != prior.metadata_identity {
             return Err(anyhow!("volume_update_conflict: growth metadata changed"));
         }
-        let host = std::fs::symlink_metadata(&metadata.device)?;
+        let host = std::fs::metadata(&metadata.device)?;
         if !host.file_type().is_block_device() || metadata.metadata.get("openstack.device_number")
             != Some(&format!("{}:{}", libc::major(host.rdev()), libc::minor(host.rdev()))) {
             return Err(anyhow!("volume_update_conflict: growth mapping changed"));

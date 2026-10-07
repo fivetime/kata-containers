@@ -70,7 +70,7 @@ pub fn audit_initial(requests: Vec<BlockAttach>) -> Result<Vec<PendingVolume>> {
     requests.into_iter().map(|request| {
         let metadata = resource::volume::direct_volumes::volume_mount_info(&request.source)?;
         live_volume::validate_metadata(&request, &metadata)?;
-        let host = std::fs::symlink_metadata(&metadata.device)?;
+        let host = std::fs::metadata(&metadata.device)?;
         if !host.file_type().is_block_device() || metadata.metadata.get("openstack.device_number")
             != Some(&format!("{}:{}", libc::major(host.rdev()), libc::minor(host.rdev()))) {
             bail!("initial host block identity differs");
