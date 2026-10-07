@@ -130,13 +130,24 @@ impl Frames {
     }
 }
 
-async fn pump<R, W>(mut from: R, mut to: W, requests: bool, transfer: Transfer) -> Result<()>
+/// Copy one direction. The requests carry the VM; `max_bandwidth` bytes a
+/// second, when not 0, paces them: Cloud Hypervisor has no limit of its
+/// own, and Nova's is kept here.
+async fn pump<R, W>(
+    mut from: R,
+    mut to: W,
+    requests: bool,
+    transfer: Transfer,
+    max_bandwidth: u64,
+) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let mut buffer = vec![0u8; 256 * 1024];
     let mut frames = Frames::default();
+    let began = tokio::time::Instant::now();
+    let mut sent: u64 = 0;
     loop {
         let n = from.read(&mut buffer).await.context("read")?;
         if n == 0 {
@@ -149,23 +160,37 @@ where
             state.bytes += n as u64;
         }
         to.write_all(&buffer[..n]).await.context("write")?;
+        if requests && max_bandwidth > 0 {
+            sent += n as u64;
+            let due = Duration::from_secs_f64(sent as f64 / max_bandwidth as f64);
+            let elapsed = began.elapsed();
+            if due > elapsed {
+                tokio::time::sleep(due - elapsed).await;
+            }
+        }
     }
 }
 
 /// Copy both ways until either side ends. On the source the requests come
 /// from the VMM's unix connection; on the destination from the TCP peer.
-async fn bridge(tcp: TcpStream, unix: UnixStream, transfer: Transfer, source: bool) {
+async fn bridge(
+    tcp: TcpStream,
+    unix: UnixStream,
+    transfer: Transfer,
+    source: bool,
+    max_bandwidth: u64,
+) {
     let (tcp_read, tcp_write) = tcp.into_split();
     let (unix_read, unix_write) = unix.into_split();
     let (requests, responses) = if source {
         tokio::join!(
-            pump(unix_read, tcp_write, true, transfer.clone()),
-            pump(tcp_read, unix_write, false, transfer.clone())
+            pump(unix_read, tcp_write, true, transfer.clone(), max_bandwidth),
+            pump(tcp_read, unix_write, false, transfer.clone(), 0)
         )
     } else {
         tokio::join!(
-            pump(tcp_read, unix_write, true, transfer.clone()),
-            pump(unix_read, tcp_write, false, transfer.clone())
+            pump(tcp_read, unix_write, true, transfer.clone(), 0),
+            pump(unix_read, tcp_write, false, transfer.clone(), 0)
         )
     };
     if let Err(error) = requests {
@@ -184,6 +209,7 @@ pub(crate) async fn send(
     api_socket_path: String,
     uri: &str,
     transfer: Transfer,
+    max_bandwidth: u64,
 ) -> Result<(JoinHandle<()>, JoinHandle<()>)> {
     let address = tcp_address(uri)?;
     let std_tcp = std::net::TcpStream::connect_timeout(&address, CONNECT_TIMEOUT)
@@ -199,7 +225,7 @@ pub(crate) async fn send(
     let bridge_transfer = transfer.clone();
     let bridge_task = tokio::spawn(async move {
         match listener.accept().await {
-            Ok((unix, _)) => bridge(tcp, unix, bridge_transfer, true).await,
+            Ok((unix, _)) => bridge(tcp, unix, bridge_transfer, true, max_bandwidth).await,
             Err(error) => set_status(
                 &bridge_transfer,
                 "failed",
@@ -342,7 +368,7 @@ pub(crate) async fn receive(
                 }
             }
         };
-        bridge(tcp, unix, bridge_transfer, false).await;
+        bridge(tcp, unix, bridge_transfer, false, 0).await;
     });
     Ok((accept_task, api_task))
 }
@@ -384,16 +410,22 @@ impl CloudHypervisorInner {
         if self.transfer_active() {
             return Err(anyhow!("migration_invalid: a migration is under way"));
         }
-        if params.downtime_ms != 0 || params.max_bandwidth != 0 {
+        if params.downtime_ms != 0 {
             info!(
                 sl!(),
-                "Cloud Hypervisor takes no downtime or bandwidth limit; {:?} is not applied",
-                params
+                "Cloud Hypervisor takes no downtime limit; {} ms is not applied",
+                params.downtime_ms
             );
         }
         let transfer = new_transfer();
-        let (bridge, api) =
-            send(&self.id, get_api_socket_path(&self.id)?, uri, transfer.clone()).await?;
+        let (bridge, api) = send(
+            &self.id,
+            get_api_socket_path(&self.id)?,
+            uri,
+            transfer.clone(),
+            params.max_bandwidth,
+        )
+        .await?;
         self.bridge = Some(bridge.abort_handle());
         self.migration_tasks.push(bridge);
         self.migration_tasks.push(api);
