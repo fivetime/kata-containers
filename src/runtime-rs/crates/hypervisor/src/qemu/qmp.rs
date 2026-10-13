@@ -257,7 +257,7 @@ impl Qmp {
     /// `migrate` returns once the transfer began; query-migrate follows it.
     pub fn migration_send(
         &mut self,
-        stream: &std::net::TcpStream,
+        stream: &impl AsRawFd,
         params: &crate::migration::MigrationParams,
     ) -> Result<()> {
         // return-path: the source's transfer completes only once the
@@ -329,7 +329,7 @@ impl Qmp {
     /// mirror into an NBD export, as libvirt's. The destination exports
     /// the devices the source copies, on a unix socket of the sandbox the
     /// shim bridges to the migration's TCP side.
-    pub fn nbd_exports_start(&mut self, socket: &str, indexes: &[u64], tls: bool) -> Result<()> {
+    pub fn nbd_exports_start(&mut self, socket: &str, indexes: &[u64]) -> Result<()> {
         self.qmp
             .execute(&qmp::nbd_server_start {
                 addr: qmp::SocketAddressLegacy::unix(qmp::UnixSocketAddressWrapper {
@@ -339,8 +339,8 @@ impl Qmp {
                         tight: None,
                     },
                 }),
-                // The TLS ends at QEMU: the shim's bridge carries it.
-                tls_creds: tls.then(|| crate::migration_tls::QEMU_TLS_CREDS.to_string()),
+                // A migration's TLS ends at the shim (migration_tls).
+                tls_creds: None,
                 tls_authz: None,
                 max_connections: None,
             })
@@ -395,9 +395,8 @@ impl Qmp {
     pub fn mirror_start(
         &mut self,
         index: u64,
-        stream: &std::net::TcpStream,
+        stream: &impl AsRawFd,
         speed: u64,
-        tls_hostname: Option<&str>,
     ) -> Result<()> {
         let fdname = format!("nova-nbd-{index}");
         self.pass_fd(stream.as_raw_fd(), &fdname)
@@ -417,9 +416,8 @@ impl Qmp {
                 nbd: qmp::BlockdevOptionsNbd {
                     server: qmp::SocketAddress::fd(qmp::FdSocketAddress { str: fdname }),
                     export: Some(export_name(index)),
-                    tls_creds: tls_hostname
-                        .map(|_| crate::migration_tls::QEMU_TLS_CREDS.to_string()),
-                    tls_hostname: tls_hostname.map(str::to_string),
+                    tls_creds: None,
+                    tls_hostname: None,
                     x_dirty_bitmap: None,
                     reconnect_delay: None,
                     open_timeout: None,
@@ -513,7 +511,7 @@ impl Qmp {
     /// Nova Kata (ADR-052): receive the VM over `stream`, a connection the
     /// shim accepted in the host's network namespace. QEMU reads an fd it is
     /// given as a connected stream, never as a listener.
-    pub fn migration_incoming_stream(&mut self, stream: &std::net::TcpStream) -> Result<()> {
+    pub fn migration_incoming_stream(&mut self, stream: &impl AsRawFd) -> Result<()> {
         // Both ends need return-path, which the source sets too. The block
         // devices are activated at the resume, not at the transfer's end:
         // a device exported for the source's copy is written until then.
@@ -2393,80 +2391,6 @@ fn mirror_node_name(index: u64) -> String {
 
 fn job_name(index: u64) -> String {
     format!("{JOB_PREFIX}{index}")
-}
-
-/// Nova Kata (ADR-052): QEMU's native TLS of a migration, as libvirt
-/// sets it: a tls-creds-x509 object of libvirt's directory, verifying the
-/// peer, and the migration's parameters naming it (and, on the source, the
-/// destination's name its certificate must carry: QEMU is given an fd and
-/// knows no name of its own).
-#[derive(serde::Serialize)]
-struct ObjectAddTlsCreds {
-    #[serde(rename = "qom-type")]
-    qom_type: &'static str,
-    id: &'static str,
-    dir: &'static str,
-    endpoint: &'static str,
-    #[serde(rename = "verify-peer")]
-    verify_peer: bool,
-}
-
-impl qapi_spec::Command for ObjectAddTlsCreds {
-    const NAME: &'static str = "object-add";
-    const ALLOW_OOB: bool = false;
-    type Ok = qapi_spec::Empty;
-}
-
-#[derive(serde::Serialize)]
-struct ObjectDel {
-    id: &'static str,
-}
-
-impl qapi_spec::Command for ObjectDel {
-    const NAME: &'static str = "object-del";
-    const ALLOW_OOB: bool = false;
-    type Ok = qapi_spec::Empty;
-}
-
-#[derive(serde::Serialize)]
-struct MigrateSetTls {
-    #[serde(rename = "tls-creds")]
-    tls_creds: &'static str,
-    #[serde(rename = "tls-hostname")]
-    tls_hostname: String,
-}
-
-impl qapi_spec::Command for MigrateSetTls {
-    const NAME: &'static str = "migrate-set-parameters";
-    const ALLOW_OOB: bool = false;
-    type Ok = qapi_spec::Empty;
-}
-
-impl Qmp {
-    /// The credentials of the migration's TLS, made anew (a VM may send
-    /// more than once), and the migration's parameters naming them.
-    /// `hostname` is the destination's address, on the source.
-    pub fn migration_tls(&mut self, server: bool, hostname: Option<&str>) -> Result<()> {
-        let _ = self.qmp.execute(&ObjectDel {
-            id: crate::migration_tls::QEMU_TLS_CREDS,
-        });
-        self.qmp
-            .execute(&ObjectAddTlsCreds {
-                qom_type: "tls-creds-x509",
-                id: crate::migration_tls::QEMU_TLS_CREDS,
-                dir: crate::migration_tls::TLS_DIR,
-                endpoint: if server { "server" } else { "client" },
-                verify_peer: true,
-            })
-            .context("migration_tls: QEMU's credentials")?;
-        self.qmp
-            .execute(&MigrateSetTls {
-                tls_creds: crate::migration_tls::QEMU_TLS_CREDS,
-                tls_hostname: hostname.unwrap_or_default().to_string(),
-            })
-            .map(|_| ())
-            .context("migration_tls: the migration's TLS parameters")
-    }
 }
 
 /// blockdev-mirror with target-is-zero, which qapi-qmp 0.15 lacks.

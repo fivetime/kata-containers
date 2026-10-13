@@ -373,7 +373,7 @@ async fn accept_migration(
                 }
             }
         };
-        let (mut stream, peer) = match accepted {
+        let (mut stream, peer): (tokio::net::TcpStream, _) = match accepted {
             Ok(accepted) => accepted,
             Err(error) => {
                 error!(sl!(), "the migration's connection was not accepted: {:?}", error);
@@ -412,14 +412,51 @@ async fn accept_migration(
         match kind {
             crate::migration::PREFACE_RAM => {
                 info!(sl!(), "the migration connected from {}", peer);
-                let stream = match stream.into_std() {
-                    Ok(stream) => stream,
-                    Err(error) => {
-                        error!(sl!(), "the migration's connection: {:?}", error);
-                        return;
+                // With TLS QEMU gets a unix connection the shim carries to
+                // the source's TLS one, of a client of the CA only.
+                let accepted = if let Some(config) = tls.clone() {
+                    let carried = std::os::unix::net::UnixStream::pair()
+                        .map_err(anyhow::Error::from)
+                        .and_then(|(vmm, shim)| {
+                            let tcp = stream.into_std()?;
+                            crate::migration_tls::serve_carried(
+                                config,
+                                tcp,
+                                shim,
+                                MIGRATION_PREFACE_TIMEOUT,
+                            )
+                            .map(|answer| (vmm, answer))
+                        });
+                    let (vmm, answer) = match carried {
+                        Ok(carried) => carried,
+                        Err(error) => {
+                            error!(sl!(), "the migration's connection: {:?}", error);
+                            return;
+                        }
+                    };
+                    match answer.await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            warn!(sl!(), "the migration from {} is refused: {:?}", peer, error);
+                            continue;
+                        }
+                        Err(_) => {
+                            warn!(sl!(), "the migration from {} is refused: its TLS ended", peer);
+                            continue;
+                        }
                     }
+                    inner.write().await.migration_accepted(&vmm)
+                } else {
+                    let stream = match stream.into_std() {
+                        Ok(stream) => stream,
+                        Err(error) => {
+                            error!(sl!(), "the migration's connection: {:?}", error);
+                            return;
+                        }
+                    };
+                    inner.write().await.migration_accepted(&stream)
                 };
-                if let Err(error) = inner.write().await.migration_accepted(&stream) {
+                if let Err(error) = accepted {
                     error!(sl!(), "QEMU did not take the migration's connection: {:?}", error);
                     return;
                 }
@@ -430,19 +467,44 @@ async fn accept_migration(
                     continue;
                 };
                 info!(sl!(), "a block copy connected from {}", peer);
+                let tls = tls.clone();
                 tokio::spawn(async move {
-                    match tokio::net::UnixStream::connect(&socket).await {
-                        Ok(mut unix) => {
-                            if let Err(error) =
-                                tokio::io::copy_bidirectional(&mut stream, &mut unix).await
-                            {
-                                debug!(sl!(), "the block copy's connection ended: {:?}", error);
+                    let Some(config) = tls else {
+                        match tokio::net::UnixStream::connect(&socket).await {
+                            Ok(mut unix) => {
+                                if let Err(error) =
+                                    tokio::io::copy_bidirectional(&mut stream, &mut unix).await
+                                {
+                                    debug!(sl!(), "the block copy's connection ended: {:?}", error);
+                                }
+                            }
+                            Err(error) => {
+                                error!(sl!(), "QEMU's NBD server at {}: {:?}", socket, error)
                             }
                         }
-                        Err(error) => {
-                            error!(sl!(), "QEMU's NBD server at {}: {:?}", socket, error)
-                        }
-                    }
+                        return;
+                    };
+                    // With TLS the carrier copies it (migration_tls).
+                    let carried = std::os::unix::net::UnixStream::connect(&socket)
+                        .with_context(|| format!("QEMU's NBD server at {socket}"))
+                        .and_then(|unix| {
+                            let tcp = stream.into_std()?;
+                            crate::migration_tls::serve_carried(
+                                config,
+                                tcp,
+                                unix,
+                                MIGRATION_PREFACE_TIMEOUT,
+                            )
+                        });
+                    let refused = match carried {
+                        Ok(answer) => match answer.await {
+                            Ok(Ok(())) => return,
+                            Ok(Err(error)) => error,
+                            Err(_) => anyhow::anyhow!("its TLS ended"),
+                        },
+                        Err(error) => error,
+                    };
+                    warn!(sl!(), "a block copy from {} is refused: {:?}", peer, refused);
                 });
             }
             _ => {
@@ -450,22 +512,9 @@ async fn accept_migration(
                 // With TLS only a source of the CA says so; anything else
                 // is dropped and the VM waits.
                 if let Some(config) = tls.clone() {
-                    let acceptor = tokio_rustls::TlsAcceptor::from(config);
-                    let mut secure = match tokio::time::timeout(
-                        MIGRATION_PREFACE_TIMEOUT,
-                        acceptor.accept(stream),
-                    )
-                    .await
-                    {
-                        Ok(Ok(secure)) => secure,
-                        Ok(Err(error)) => {
-                            warn!(sl!(), "the word from {} is refused: {:?}", peer, error);
-                            continue;
-                        }
-                        Err(_) => {
-                            warn!(sl!(), "the word from {} came with no TLS in time", peer);
-                            continue;
-                        }
+                    let mut secure = match accept_tls(config, stream, peer).await {
+                        Some(secure) => secure,
+                        None => continue,
                     };
                     inner.write().await.mark_disk_synced();
                     if let Err(error) = secure.write_all(crate::migration::PREFACE_ACK).await {
@@ -481,6 +530,27 @@ async fn accept_migration(
                 }
                 info!(sl!(), "the source says the copied blocks are written");
             }
+        }
+    }
+}
+
+/// The TLS of a migration's connection, of a client of the CA; None (and a
+/// warning) for anything else, which is dropped.
+async fn accept_tls(
+    config: Arc<rustls::ServerConfig>,
+    stream: tokio::net::TcpStream,
+    peer: std::net::SocketAddr,
+) -> Option<tokio_rustls::server::TlsStream<tokio::net::TcpStream>> {
+    let acceptor = tokio_rustls::TlsAcceptor::from(config);
+    match tokio::time::timeout(MIGRATION_PREFACE_TIMEOUT, acceptor.accept(stream)).await {
+        Ok(Ok(secure)) => Some(secure),
+        Ok(Err(error)) => {
+            warn!(sl!(), "the TLS of a connection from {} is refused: {:?}", peer, error);
+            None
+        }
+        Err(_) => {
+            warn!(sl!(), "a connection from {} made no TLS in time", peer);
+            None
         }
     }
 }

@@ -124,6 +124,35 @@ enum Told {
 const COPY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const SYNCED_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// A connection QEMU is given: the TCP one, or with TLS the VMM's end of
+/// the shim's (migration_tls: QEMU here has no TLS of its own).
+enum Connection {
+    Plain(std::net::TcpStream),
+    Carried(std::os::unix::net::UnixStream),
+}
+
+impl std::os::fd::AsRawFd for Connection {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        match self {
+            Connection::Plain(stream) => stream.as_raw_fd(),
+            Connection::Carried(stream) => stream.as_raw_fd(),
+        }
+    }
+}
+
+/// Connect a migration connection for QEMU, TLS or not.
+fn connect_for_qemu(address: &std::net::SocketAddr, kind: &str, tls: bool) -> Result<Connection> {
+    if tls {
+        return crate::migration_tls::connect_carried(
+            *address,
+            crate::migration::preface(kind),
+            COPY_CONNECT_TIMEOUT,
+        )
+        .map(Connection::Carried);
+    }
+    connect_with_preface(address, kind).map(Connection::Plain)
+}
+
 /// Connect a migration connection in the host's network namespace and say
 /// what it carries.
 fn connect_with_preface(
@@ -237,18 +266,15 @@ impl QemuInner {
             .qmp
             .as_mut()
             .context("migration_unsupported: QMP is not connected")?;
-        // TLS, as libvirt's native TLS: QEMU's own on the VM's and the
-        // copy's streams, of libvirt's certificates; the destination's
-        // certificate must name the address the source connects to.
-        let tls_hostname = params.tls.then(|| address.ip().to_string());
+        // TLS of libvirt's certificates, ended by the shim; the
+        // destination's certificate must name the address connected to.
         if params.tls {
             crate::migration_tls::check(std::path::Path::new(crate::migration_tls::TLS_DIR))?;
-            qmp.migration_tls(false, tls_hostname.as_deref())?;
         }
         // The shim runs in the host's network namespace, QEMU in the
         // sandbox's: the shim connects, QEMU gets the connection.
         if params.copy.is_empty() {
-            let stream = connect_with_preface(&address, crate::migration::PREFACE_RAM)?;
+            let stream = connect_for_qemu(&address, crate::migration::PREFACE_RAM, params.tls)?;
             return qmp.migration_send(&stream, params);
         }
         // A block copy first: each device is mirrored into the
@@ -259,11 +285,8 @@ impl QemuInner {
         indexes.dedup();
         let mut started = Vec::new();
         for &index in &indexes {
-            let result = connect_with_preface(&address, crate::migration::PREFACE_NBD).and_then(
-                |stream| {
-                    qmp.mirror_start(index, &stream, params.max_bandwidth, tls_hostname.as_deref())
-                },
-            );
+            let result = connect_for_qemu(&address, crate::migration::PREFACE_NBD, params.tls)
+                .and_then(|stream| qmp.mirror_start(index, &stream, params.max_bandwidth));
             if let Err(error) = result {
                 for &done in &started {
                     let _ = qmp.mirror_cancel(done, true);
@@ -375,9 +398,12 @@ impl QemuInner {
                         return Ok(active("copying", &jobs));
                     }
                     // The mirrors follow the guest's writes: the VM goes.
+                    let (done, total) = copy_bytes(&jobs);
+                    info!(sl!(), "the copy converged at {}/{} bytes; the VM follows", done, total);
                     let address = crate::migration::tcp_address(&copy.uri)?;
-                    let sent = connect_with_preface(&address, crate::migration::PREFACE_RAM)
-                        .and_then(|stream| qmp.migration_send(&stream, &copy.params));
+                    let sent =
+                        connect_for_qemu(&address, crate::migration::PREFACE_RAM, copy.params.tls)
+                            .and_then(|stream| qmp.migration_send(&stream, &copy.params));
                     match sent {
                         Ok(()) => copy.phase = CopyPhase::Ram,
                         Err(error) => {
@@ -400,6 +426,12 @@ impl QemuInner {
                     progress.phase = "ram".to_string();
                     match progress.status.as_str() {
                         "completed" => {
+                            info!(
+                                sl!(),
+                                "the VM's transfer completed; the copy ends from {}/{} bytes",
+                                disk_transferred,
+                                disk_total
+                            );
                             // The guest is stopped here for good (return
                             // path: the destination loaded the state). The
                             // mirrors write their last blocks and end;
@@ -432,6 +464,7 @@ impl QemuInner {
                         return Ok(active("syncing", &jobs));
                     }
                     let (disk_transferred, disk_total) = copy_bytes(&jobs);
+                    info!(sl!(), "the copy ended at {}/{} bytes", disk_transferred, disk_total);
                     let failed = jobs
                         .iter()
                         .find(|job| copy.indexes.contains(&job.index) && !job.error.is_empty())
@@ -534,8 +567,8 @@ impl QemuInner {
     }
 
     /// The destination: whether the migration is TLS, its certificates
-    /// checked and QEMU's credentials made, before anything is accepted.
-    pub(crate) fn migration_incoming_tls(&mut self) -> Result<bool> {
+    /// checked before anything is accepted.
+    pub(crate) fn migration_incoming_tls(&self) -> Result<bool> {
         let tls = self
             .incoming
             .as_ref()
@@ -543,10 +576,6 @@ impl QemuInner {
             .tls;
         if tls {
             crate::migration_tls::check(std::path::Path::new(crate::migration_tls::TLS_DIR))?;
-            self.qmp
-                .as_mut()
-                .context("migration_unsupported: QMP is not connected")?
-                .migration_tls(true, None)?;
         }
         Ok(tls)
     }
@@ -558,7 +587,7 @@ impl QemuInner {
             .incoming
             .as_ref()
             .context("migration_invalid: this VM does not receive a migration")?;
-        let (indexes, tls) = (incoming.copied_indexes(), incoming.tls);
+        let indexes = incoming.copied_indexes();
         if indexes.is_empty() || !self.exports.is_empty() {
             return Ok(self.nbd_socket.clone());
         }
@@ -567,7 +596,7 @@ impl QemuInner {
         self.qmp
             .as_mut()
             .context("migration_unsupported: QMP is not connected")?
-            .nbd_exports_start(&socket, &indexes, tls)?;
+            .nbd_exports_start(&socket, &indexes)?;
         self.exports = indexes;
         self.nbd_socket = Some(socket.clone());
         Ok(Some(socket))
@@ -609,7 +638,7 @@ impl QemuInner {
     }
 
     /// The source connected: QEMU receives the VM over the connection.
-    pub(crate) fn migration_accepted(&mut self, stream: &std::net::TcpStream) -> Result<()> {
+    pub(crate) fn migration_accepted(&mut self, stream: &impl std::os::fd::AsRawFd) -> Result<()> {
         self.qmp
             .as_mut()
             .context("migration_unsupported: QMP is not connected")?

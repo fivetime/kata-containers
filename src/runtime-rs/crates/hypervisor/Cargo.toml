@@ -21,7 +21,7 @@ serde_json = { workspace = true }
 slog = { workspace = true }
 slog-scope = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync", "fs", "process", "io-util"] }
+tokio = { workspace = true, features = ["sync", "fs", "process", "io-util", "rt-multi-thread"] }
 vmm-sys-util = "0.15.0"
 rand = { workspace = true }
 path-clean = "1.0.1"
