@@ -423,22 +423,20 @@ impl Qmp {
                 },
             }))
             .with_context(|| format!("open the destination's {}", export_name(index)))?;
+        // The destination's device is a blank sparse file (the snapshotter's
+        // blank root): the mirror copies what the source has and skips its
+        // holes, which it would otherwise write as zeroes, counted against
+        // the bandwidth and allocated on the destination (target-is-zero,
+        // QEMU 10.1, which the crate's schema predates).
         self.qmp
-            .execute(&qmp::blockdev_mirror {
-                job_id: Some(job_name(index)),
+            .execute(&BlockdevMirrorOfBlank {
+                job_id: job_name(index),
                 device: block_node_name(index),
                 target,
-                sync: qmp::MirrorSyncMode::full,
+                sync: "full",
                 speed: (speed > 0).then_some(speed as i64),
-                auto_dismiss: Some(false),
-                auto_finalize: None,
-                buf_size: None,
-                copy_mode: None,
-                filter_node_name: None,
-                granularity: None,
-                on_source_error: None,
-                on_target_error: None,
-                replaces: None,
+                auto_dismiss: false,
+                target_is_zero: true,
             })
             .map(|_| ())
             .with_context(|| format!("mirror {}", block_node_name(index)))
@@ -2392,6 +2390,28 @@ fn mirror_node_name(index: u64) -> String {
 
 fn job_name(index: u64) -> String {
     format!("{JOB_PREFIX}{index}")
+}
+
+/// blockdev-mirror with target-is-zero, which qapi-qmp 0.15 lacks.
+#[derive(serde::Serialize)]
+struct BlockdevMirrorOfBlank {
+    #[serde(rename = "job-id")]
+    job_id: String,
+    device: String,
+    target: String,
+    sync: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speed: Option<i64>,
+    #[serde(rename = "auto-dismiss")]
+    auto_dismiss: bool,
+    #[serde(rename = "target-is-zero")]
+    target_is_zero: bool,
+}
+
+impl qapi_spec::Command for BlockdevMirrorOfBlank {
+    const NAME: &'static str = "blockdev-mirror";
+    const ALLOW_OOB: bool = false;
+    type Ok = qapi_spec::Empty;
 }
 
 /// A mirror job of a block copy, as query-block-jobs has it.
