@@ -348,10 +348,12 @@ async fn accept_migration(
     nbd_socket: Option<String>,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // The first connection of any kind must come in time; the VM's own
+    // follows a block copy, which may take long.
     let first_by = tokio::time::Instant::now() + MIGRATION_ACCEPT_TIMEOUT;
-    let mut ram_taken = false;
+    let mut connected = false;
     loop {
-        let accepted = if ram_taken {
+        let accepted = if connected {
             listener.accept().await
         } else {
             match tokio::time::timeout_at(first_by, listener.accept()).await {
@@ -369,6 +371,7 @@ async fn accept_migration(
                 return;
             }
         };
+        connected = true;
         let preface = async {
             let mut line = Vec::with_capacity(crate::migration::PREFACE_MAX);
             loop {
@@ -411,7 +414,6 @@ async fn accept_migration(
                     error!(sl!(), "QEMU did not take the migration's connection: {:?}", error);
                     return;
                 }
-                ram_taken = true;
             }
             crate::migration::PREFACE_NBD => {
                 let Some(socket) = nbd_socket.clone() else {
