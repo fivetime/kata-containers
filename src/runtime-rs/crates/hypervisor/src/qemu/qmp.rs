@@ -321,7 +321,181 @@ impl Qmp {
             total_ms: positive(info.total_time),
             downtime_ms: positive(info.downtime),
             error: info.error_desc.clone().unwrap_or_default(),
+            ..Default::default()
         })
+    }
+
+    /// Nova Kata (ADR-052): the block copy of a live migration, QEMU's
+    /// mirror into an NBD export, as libvirt's. The destination exports
+    /// the devices the source copies, on a unix socket of the sandbox the
+    /// shim bridges to the migration's TCP side.
+    pub fn nbd_exports_start(&mut self, socket: &str, indexes: &[u64]) -> Result<()> {
+        self.qmp
+            .execute(&qmp::nbd_server_start {
+                addr: qmp::SocketAddressLegacy::unix(qmp::UnixSocketAddressWrapper {
+                    data: qmp::UnixSocketAddress {
+                        path: socket.to_string(),
+                        abstract_: None,
+                        tight: None,
+                    },
+                }),
+                tls_creds: None,
+                tls_authz: None,
+                max_connections: None,
+            })
+            .context("start the NBD server")?;
+        for &index in indexes {
+            let name = export_name(index);
+            self.qmp
+                .execute(&qmp::block_export_add(qmp::BlockExportOptions::nbd {
+                    base: qmp::BlockExportOptionsBase {
+                        id: name.clone(),
+                        node_name: block_node_name(index),
+                        writable: Some(true),
+                        writethrough: None,
+                        fixed_iothread: None,
+                        iothread: None,
+                    },
+                    nbd: qmp::BlockExportOptionsNbd {
+                        base: qmp::BlockExportOptionsNbdBase {
+                            name: Some(name.clone()),
+                            description: None,
+                        },
+                        allocation_depth: None,
+                        bitmaps: None,
+                    },
+                }))
+                .with_context(|| format!("export {name}"))?;
+        }
+        Ok(())
+    }
+
+    /// The exports end before the VM runs: a device the guest writes is
+    /// not exported.
+    pub fn nbd_exports_stop(&mut self, indexes: &[u64]) -> Result<()> {
+        for &index in indexes {
+            if let Err(error) = self.qmp.execute(&qmp::block_export_del {
+                id: export_name(index),
+                mode: Some(qmp::BlockExportRemoveMode::hard),
+            }) {
+                debug!(sl!(), "drop the export {}: {:?}", export_name(index), error);
+            }
+        }
+        self.qmp
+            .execute(&qmp::nbd_server_stop {})
+            .map(|_| ())
+            .context("stop the NBD server")
+    }
+
+    /// The source: mirror the device into the destination's export over
+    /// `stream`, a connection the shim made (QEMU has no route to the
+    /// migration network). The job keeps its end until it is dismissed, so
+    /// that its error is read.
+    pub fn mirror_start(
+        &mut self,
+        index: u64,
+        stream: &std::net::TcpStream,
+        speed: u64,
+    ) -> Result<()> {
+        let fdname = format!("nova-nbd-{index}");
+        self.pass_fd(stream.as_raw_fd(), &fdname)
+            .context("hand the copy's connection to QEMU")?;
+        let target = mirror_node_name(index);
+        self.qmp
+            .execute(&qmp::blockdev_add(qmp::BlockdevOptions::nbd {
+                base: qmp::BlockdevOptionsBase {
+                    auto_read_only: None,
+                    cache: None,
+                    detect_zeroes: None,
+                    discard: None,
+                    force_share: None,
+                    node_name: Some(target.clone()),
+                    read_only: None,
+                },
+                nbd: qmp::BlockdevOptionsNbd {
+                    server: qmp::SocketAddress::fd(qmp::FdSocketAddress { str: fdname }),
+                    export: Some(export_name(index)),
+                    tls_creds: None,
+                    tls_hostname: None,
+                    x_dirty_bitmap: None,
+                    reconnect_delay: None,
+                    open_timeout: None,
+                },
+            }))
+            .with_context(|| format!("open the destination's {}", export_name(index)))?;
+        self.qmp
+            .execute(&qmp::blockdev_mirror {
+                job_id: Some(job_name(index)),
+                device: block_node_name(index),
+                target,
+                sync: qmp::MirrorSyncMode::full,
+                speed: (speed > 0).then_some(speed as i64),
+                auto_dismiss: Some(false),
+                auto_finalize: None,
+                buf_size: None,
+                copy_mode: None,
+                filter_node_name: None,
+                granularity: None,
+                on_source_error: None,
+                on_target_error: None,
+                replaces: None,
+            })
+            .map(|_| ())
+            .with_context(|| format!("mirror {}", block_node_name(index)))
+    }
+
+    /// The mirror jobs of the copy, as they stand.
+    pub fn mirror_jobs(&mut self) -> Result<Vec<MirrorJob>> {
+        let jobs = self
+            .qmp
+            .execute(&qmp::query_block_jobs {})
+            .context("query the block jobs")?;
+        let mut result = Vec::new();
+        for job in jobs {
+            let qmp::BlockJobInfo::mirror { base, .. } = &job else {
+                continue;
+            };
+            let Some(index) = base
+                .device
+                .strip_prefix(JOB_PREFIX)
+                .and_then(|rest| rest.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            result.push(MirrorJob {
+                index,
+                ready: base.ready,
+                concluded: matches!(base.status, qmp::JobStatus::concluded | qmp::JobStatus::null),
+                offset: base.offset.max(0) as u64,
+                len: base.len.max(0) as u64,
+                error: base.error.clone().unwrap_or_default(),
+            });
+        }
+        Ok(result)
+    }
+
+    /// Cancel a mirror: a ready one writes its last blocks first (the
+    /// source keeps its own device; nothing pivots), a forced one stops.
+    pub fn mirror_cancel(&mut self, index: u64, force: bool) -> Result<()> {
+        self.qmp
+            .execute(&qmp::block_job_cancel {
+                device: job_name(index),
+                force: Some(force),
+            })
+            .map(|_| ())
+            .with_context(|| format!("cancel {}", job_name(index)))
+    }
+
+    /// Drop a concluded job and its target node; absent is fine.
+    pub fn mirror_dismiss(&mut self, index: u64) {
+        if let Err(error) = self.qmp.execute(&qmp::job_dismiss { id: job_name(index) }) {
+            debug!(sl!(), "dismiss {}: {:?}", job_name(index), error);
+        }
+        if let Err(error) = self.qmp.execute(&qmp::blockdev_del {
+            node_name: mirror_node_name(index),
+        }) {
+            debug!(sl!(), "drop {}: {:?}", mirror_node_name(index), error);
+        }
     }
 
     pub fn execute_migration_incoming(&mut self, uri: &str) -> Result<()> {
@@ -339,15 +513,23 @@ impl Qmp {
     /// shim accepted in the host's network namespace. QEMU reads an fd it is
     /// given as a connected stream, never as a listener.
     pub fn migration_incoming_stream(&mut self, stream: &std::net::TcpStream) -> Result<()> {
-        // Both ends need return-path, which the source sets too.
+        // Both ends need return-path, which the source sets too. The block
+        // devices are activated at the resume, not at the transfer's end:
+        // a device exported for the source's copy is written until then.
         self.qmp
             .execute(&migrate_set_capabilities {
-                capabilities: vec![MigrationCapabilityStatus {
-                    capability: MigrationCapability::return_path,
-                    state: true,
-                }],
+                capabilities: vec![
+                    MigrationCapabilityStatus {
+                        capability: MigrationCapability::return_path,
+                        state: true,
+                    },
+                    MigrationCapabilityStatus {
+                        capability: MigrationCapability::late_block_activate,
+                        state: true,
+                    },
+                ],
             })
-            .context("set the migration's return path")?;
+            .context("set the migration's capabilities")?;
         self.pass_fd(stream.as_raw_fd(), MIGRATION_IN_FD)
             .context("hand the migration's connection to QEMU")?;
         self.execute_migration_incoming(&format!("fd:{MIGRATION_IN_FD}"))
@@ -2192,8 +2374,37 @@ mod nova_volume_qos_tests {
 }
 
 /// Generate a blockdev node name based on the given index.
-fn block_node_name(index: u64) -> String {
+pub(crate) fn block_node_name(index: u64) -> String {
     format!("drive-{index}")
+}
+
+// Nova Kata (ADR-052): the names of a block copy's parts, by the device's
+// index: the destination's export, the source's node of it and its job.
+const JOB_PREFIX: &str = "copy-";
+
+fn export_name(index: u64) -> String {
+    format!("block-{index}")
+}
+
+fn mirror_node_name(index: u64) -> String {
+    format!("mirror-{index}")
+}
+
+fn job_name(index: u64) -> String {
+    format!("{JOB_PREFIX}{index}")
+}
+
+/// A mirror job of a block copy, as query-block-jobs has it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MirrorJob {
+    pub index: u64,
+    /// The mirror converged: the target has every block, and follows.
+    pub ready: bool,
+    /// The job ended, with `error` if it failed; it waits to be dismissed.
+    pub concluded: bool,
+    pub offset: u64,
+    pub len: u64,
+    pub error: String,
 }
 
 #[cfg(test)]

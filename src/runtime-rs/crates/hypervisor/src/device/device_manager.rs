@@ -371,9 +371,12 @@ impl DeviceManager {
                 {
                     continue;
                 }
+                // Which devices are copied is the gateway's to say, by
+                // what the root is; the shim names them all alike.
                 pins.push(crate::migration::BlockPin {
                     path: config.path_on_host,
                     index: config.index,
+                    copy: false,
                 });
             }
         }

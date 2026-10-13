@@ -775,9 +775,10 @@ impl VirtSandbox {
                 Ok(progress) => {
                     if progress.ended() && progress.status != "completed" {
                         // The VM runs on here: one stopped for a forced
-                        // completion runs again before the end is told.
+                        // completion runs again before the end is told. An
+                        // undecided end resumes nothing (one writer).
                         let mut state = self.migration.lock().await;
-                        if state.forced {
+                        if state.forced && !progress.undecided {
                             if let Err(err) = self.hypervisor.resume_vm().await {
                                 error!(sl!(), "resume the VM after its migration: {:?}", err);
                             }
@@ -1181,6 +1182,7 @@ impl Sandbox for VirtSandbox {
                 let params = hypervisor::migration::MigrationParams {
                     downtime_ms: update.downtime_ms.unwrap_or(0),
                     max_bandwidth: update.max_bandwidth.unwrap_or(0),
+                    copy: update.copy.clone().unwrap_or_default(),
                 };
                 // The agent stops answering when the VM leaves: the health
                 // check must not end the shim meanwhile.

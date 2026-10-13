@@ -33,6 +33,8 @@ const MIGRATION_RESUME_POLL: std::time::Duration = std::time::Duration::from_mil
 /// Consecutive queries of the transfer that fail before the watch is given
 /// up: a QEMU that answers no more is gone.
 const MIGRATION_RESUME_FAILURES: u32 = 50;
+/// How long a connection has to say what it carries.
+const MIGRATION_PREFACE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Debug)]
 pub struct Qemu {
@@ -159,45 +161,28 @@ impl Hypervisor for Qemu {
         self.inner.write().await.migration_cancel()
     }
     /// Bind the migration's listener now, so that a port in use fails the
-    /// create; accept the source's connection when it comes, in a task, and
-    /// give it to QEMU, which waits in `-incoming defer`. A source that
-    /// never connects leaves the VM waiting until the destination's
-    /// rollback deletes it.
+    /// create, and export the devices the source copies; accept the
+    /// source's connections in a task and give each to QEMU by what its
+    /// preface says it carries: the VM (QEMU waits in `-incoming defer`),
+    /// a block copy's NBD client (bridged to QEMU's NBD server on a unix
+    /// socket of the sandbox), or the word that the copied blocks are
+    /// written. A source that never connects leaves the VM waiting until
+    /// the destination's rollback deletes it.
     async fn migration_receive(&self) -> Result<()> {
-        let listener = self.inner.read().await.migration_listen()?;
+        let (listener, nbd_socket) = {
+            let mut inner = self.inner.write().await;
+            let listener = inner.migration_listen()?;
+            let nbd_socket = inner.migration_exports_start()?;
+            (listener, nbd_socket)
+        };
         listener
             .set_nonblocking(true)
             .context("migration_failed: the listener")?;
         let listener =
             tokio::net::TcpListener::from_std(listener).context("migration_failed: the listener")?;
+        let accepting = tokio::spawn(accept_migration(listener, self.inner.clone(), nbd_socket));
         let inner = self.inner.clone();
         tokio::spawn(async move {
-            let accepted =
-                tokio::time::timeout(MIGRATION_ACCEPT_TIMEOUT, listener.accept()).await;
-            drop(listener);
-            let (stream, peer) = match accepted {
-                Ok(Ok(accepted)) => accepted,
-                Ok(Err(error)) => {
-                    error!(sl!(), "the migration's connection was not accepted: {:?}", error);
-                    return;
-                }
-                Err(_) => {
-                    warn!(sl!(), "no migration connected within {:?}", MIGRATION_ACCEPT_TIMEOUT);
-                    return;
-                }
-            };
-            info!(sl!(), "the migration connected from {}", peer);
-            let stream = match stream.into_std() {
-                Ok(stream) => stream,
-                Err(error) => {
-                    error!(sl!(), "the migration's connection: {:?}", error);
-                    return;
-                }
-            };
-            if let Err(error) = inner.write().await.migration_accepted(&stream) {
-                error!(sl!(), "QEMU did not take the migration's connection: {:?}", error);
-                return;
-            }
             // Nova Kata (ADR-052): the VM is resumed the moment QEMU reports
             // the transfer complete, as Cloud Hypervisor resumes its own.
             // With return-path set at both ends the source's QEMU is stopped
@@ -205,7 +190,9 @@ impl Hypervisor for Qemu {
             // the finish that Nova's post brings later finds it running.
             // Waiting for that finish cost the guest the seconds between the
             // source's record of its release and the destination's reading
-            // of it.
+            // of it. A VM whose devices the source copies is complete only
+            // once the source said their last blocks are written, which
+            // migration_progress waits for.
             let mut failures = 0;
             loop {
                 tokio::time::sleep(MIGRATION_RESUME_POLL).await;
@@ -215,6 +202,7 @@ impl Hypervisor for Qemu {
                         failures += 1;
                         if failures >= MIGRATION_RESUME_FAILURES {
                             warn!(sl!(), "the transfer received cannot be queried: {:?}", error);
+                            accepting.abort();
                             return;
                         }
                         continue;
@@ -228,10 +216,12 @@ impl Hypervisor for Qemu {
                             error!(sl!(), "the VM received is not resumed: {:?}", error)
                         }
                     }
+                    accepting.abort();
                     return;
                 }
                 if progress.ended() {
                     info!(sl!(), "the transfer received ended {}", progress.status);
+                    accepting.abort();
                     return;
                 }
             }
@@ -345,6 +335,115 @@ impl Hypervisor for Qemu {
             .write()
             .await
             .resolve_vfio_device_pci_path(hostdev_id)
+    }
+}
+
+/// Nova Kata (ADR-052): the connections of the migration this VM receives.
+/// The first must come within MIGRATION_ACCEPT_TIMEOUT; the loop ends when
+/// the transfer ends (the watcher aborts it). The preface of a connection
+/// is read a byte at a time: what follows it belongs to QEMU.
+async fn accept_migration(
+    listener: tokio::net::TcpListener,
+    inner: Arc<RwLock<QemuInner>>,
+    nbd_socket: Option<String>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let first_by = tokio::time::Instant::now() + MIGRATION_ACCEPT_TIMEOUT;
+    let mut ram_taken = false;
+    loop {
+        let accepted = if ram_taken {
+            listener.accept().await
+        } else {
+            match tokio::time::timeout_at(first_by, listener.accept()).await {
+                Ok(accepted) => accepted,
+                Err(_) => {
+                    warn!(sl!(), "no migration connected within {:?}", MIGRATION_ACCEPT_TIMEOUT);
+                    return;
+                }
+            }
+        };
+        let (mut stream, peer) = match accepted {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                error!(sl!(), "the migration's connection was not accepted: {:?}", error);
+                return;
+            }
+        };
+        let preface = async {
+            let mut line = Vec::with_capacity(crate::migration::PREFACE_MAX);
+            loop {
+                let byte = stream.read_u8().await?;
+                line.push(byte);
+                if byte == b'\n' || line.len() >= crate::migration::PREFACE_MAX {
+                    break;
+                }
+            }
+            Ok::<Vec<u8>, std::io::Error>(line)
+        };
+        let kind = match tokio::time::timeout(MIGRATION_PREFACE_TIMEOUT, preface).await {
+            Ok(Ok(line)) => match crate::migration::parse_preface(&line) {
+                Ok(kind) => kind,
+                Err(error) => {
+                    warn!(sl!(), "a connection from {} is refused: {:?}", peer, error);
+                    continue;
+                }
+            },
+            Ok(Err(error)) => {
+                warn!(sl!(), "a connection from {} ended before its preface: {:?}", peer, error);
+                continue;
+            }
+            Err(_) => {
+                warn!(sl!(), "a connection from {} said nothing; it is dropped", peer);
+                continue;
+            }
+        };
+        match kind {
+            crate::migration::PREFACE_RAM => {
+                info!(sl!(), "the migration connected from {}", peer);
+                let stream = match stream.into_std() {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        error!(sl!(), "the migration's connection: {:?}", error);
+                        return;
+                    }
+                };
+                if let Err(error) = inner.write().await.migration_accepted(&stream) {
+                    error!(sl!(), "QEMU did not take the migration's connection: {:?}", error);
+                    return;
+                }
+                ram_taken = true;
+            }
+            crate::migration::PREFACE_NBD => {
+                let Some(socket) = nbd_socket.clone() else {
+                    warn!(sl!(), "a block copy from {} is refused: nothing is exported", peer);
+                    continue;
+                };
+                info!(sl!(), "a block copy connected from {}", peer);
+                tokio::spawn(async move {
+                    match tokio::net::UnixStream::connect(&socket).await {
+                        Ok(mut unix) => {
+                            if let Err(error) =
+                                tokio::io::copy_bidirectional(&mut stream, &mut unix).await
+                            {
+                                debug!(sl!(), "the block copy's connection ended: {:?}", error);
+                            }
+                        }
+                        Err(error) => {
+                            error!(sl!(), "QEMU's NBD server at {}: {:?}", socket, error)
+                        }
+                    }
+                });
+            }
+            _ => {
+                // The copied blocks are all written: the VM is whole here.
+                inner.write().await.mark_disk_synced();
+                if let Err(error) = stream.write_all(crate::migration::PREFACE_ACK).await {
+                    warn!(sl!(), "acknowledge the copy's end to {}: {:?}", peer, error);
+                }
+                let _ = stream.shutdown().await;
+                info!(sl!(), "the source says the copied blocks are written");
+            }
+        }
     }
 }
 

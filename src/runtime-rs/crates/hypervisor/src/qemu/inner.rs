@@ -71,6 +71,101 @@ pub struct QemuInner {
 
     // Nova Kata (ADR-052): the VM receives a live migration.
     incoming: Option<crate::migration::MigrateIn>,
+    // The block copy of a migration this VM sends (None without one).
+    copy: Option<BlockCopy>,
+    // The devices this VM exports for the source's copy, the socket they
+    // are served on, and whether the source said their last blocks are
+    // written: the VM is resumed only then.
+    exports: Vec<u64>,
+    nbd_socket: Option<String>,
+    disk_synced: bool,
+}
+
+/// Nova Kata (ADR-052): the block copy that precedes the VM a source
+/// sends: the devices mirrored into the destination's, and where the
+/// transfer stands. query-migrate alone no longer says: the copy's phases
+/// are driven from migration_progress, which the sandbox polls.
+#[derive(Debug)]
+struct BlockCopy {
+    indexes: Vec<u64>,
+    uri: String,
+    params: crate::migration::MigrationParams,
+    phase: CopyPhase,
+    cancel_requested: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CopyPhase {
+    /// The mirrors run until they converge.
+    Copying,
+    /// The mirrors follow the guest's writes; the VM is sent.
+    Ram,
+    /// The VM is sent and the guest stopped here for good; the mirrors'
+    /// last blocks are written, then the destination is told.
+    Syncing,
+    /// The transfer failed or was cancelled; the mirrors are stopped and
+    /// dismissed, then the end (its status and error) is reported.
+    Aborting(String, String),
+    Ended(crate::migration::MigrationProgress),
+}
+
+/// How the word that the copied blocks are written reached the
+/// destination, or not.
+enum Told {
+    /// The destination acknowledged: it holds the whole VM.
+    Acknowledged,
+    /// The destination could not be reached at all: it has no word, and
+    /// never resumes without one.
+    NotReached(String),
+    /// The word may have reached it: neither side may resume.
+    Unknown(String),
+}
+
+const COPY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const SYNCED_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Connect a migration connection in the host's network namespace and say
+/// what it carries.
+fn connect_with_preface(
+    address: &std::net::SocketAddr,
+    kind: &str,
+) -> Result<std::net::TcpStream> {
+    use std::io::Write;
+    let mut stream = std::net::TcpStream::connect_timeout(address, COPY_CONNECT_TIMEOUT)
+        .with_context(|| format!("migration_failed: connect to {address}"))?;
+    stream
+        .set_nodelay(true)
+        .context("migration_failed: the connection")?;
+    stream
+        .write_all(&crate::migration::preface(kind))
+        .with_context(|| format!("migration_failed: the preface to {address}"))?;
+    Ok(stream)
+}
+
+/// Tell the destination that the copied blocks are all written, and read
+/// its acknowledgement.
+fn tell_synced(address: &std::net::SocketAddr) -> Told {
+    use std::io::{Read, Write};
+    let mut stream = match std::net::TcpStream::connect_timeout(address, COPY_CONNECT_TIMEOUT) {
+        Ok(stream) => stream,
+        Err(error) => return Told::NotReached(format!("connect to {address}: {error}")),
+    };
+    let _ = stream.set_nodelay(true);
+    if let Err(error) = stream.write_all(&crate::migration::preface(crate::migration::PREFACE_SYNCED)) {
+        return Told::Unknown(format!("the word to {address}: {error}"));
+    }
+    let _ = stream.set_read_timeout(Some(SYNCED_ACK_TIMEOUT));
+    let mut answer = [0u8; 3];
+    match stream.read_exact(&mut answer) {
+        Ok(()) if answer == crate::migration::PREFACE_ACK => Told::Acknowledged,
+        Ok(()) => Told::Unknown(format!("the answer of {address}: {answer:?}")),
+        Err(error) => Told::Unknown(format!("the answer of {address}: {error}")),
+    }
+}
+
+fn copy_bytes(jobs: &[super::qmp::MirrorJob]) -> (u64, u64) {
+    jobs.iter()
+        .fold((0, 0), |(done, total), job| (done + job.offset, total + job.len))
 }
 
 impl QemuInner {
@@ -85,6 +180,10 @@ impl QemuInner {
 
             exit_notify: Some(exit_notify),
             incoming: None,
+            copy: None,
+            exports: Vec::new(),
+            nbd_socket: None,
+            disk_synced: false,
         }
     }
 
@@ -113,32 +212,340 @@ impl QemuInner {
         params: &crate::migration::MigrationParams,
     ) -> Result<()> {
         let address = crate::migration::tcp_address(uri)?;
+        if self.copy.is_some() {
+            return Err(anyhow!("migration_invalid: a migration is under way"));
+        }
         let qmp = self
             .qmp
             .as_mut()
             .context("migration_unsupported: QMP is not connected")?;
         // The shim runs in the host's network namespace, QEMU in the
         // sandbox's: the shim connects, QEMU gets the connection.
-        let stream = std::net::TcpStream::connect_timeout(
-            &address,
-            std::time::Duration::from_secs(10),
-        )
-        .with_context(|| format!("migration_failed: connect to {address}"))?;
-        qmp.migration_send(&stream, params)
+        if params.copy.is_empty() {
+            let stream = connect_with_preface(&address, crate::migration::PREFACE_RAM)?;
+            return qmp.migration_send(&stream, params);
+        }
+        // A block copy first: each device is mirrored into the
+        // destination's export over a connection of its own; the VM
+        // follows once the mirrors converged (copy_progress).
+        let mut indexes = params.copy.clone();
+        indexes.sort_unstable();
+        indexes.dedup();
+        let mut started = Vec::new();
+        for &index in &indexes {
+            let result = connect_with_preface(&address, crate::migration::PREFACE_NBD)
+                .and_then(|stream| qmp.mirror_start(index, &stream, params.max_bandwidth));
+            if let Err(error) = result {
+                for &done in &started {
+                    let _ = qmp.mirror_cancel(done, true);
+                }
+                Self::settle_mirrors(qmp, &started);
+                return Err(error);
+            }
+            started.push(index);
+        }
+        self.copy = Some(BlockCopy {
+            indexes,
+            uri: uri.to_string(),
+            params: params.clone(),
+            phase: CopyPhase::Copying,
+            cancel_requested: false,
+        });
+        Ok(())
+    }
+
+    /// Wait for cancelled mirrors to conclude and dismiss them, so that a
+    /// later send finds no job of theirs.
+    fn settle_mirrors(qmp: &mut Qmp, indexes: &[u64]) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let pending = match qmp.mirror_jobs() {
+                Ok(jobs) => jobs
+                    .iter()
+                    .any(|job| indexes.contains(&job.index) && !job.concluded),
+                Err(_) => false,
+            };
+            if !pending || std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        for &index in indexes {
+            qmp.mirror_dismiss(index);
+        }
     }
 
     pub(crate) fn migration_progress(&mut self) -> Result<crate::migration::MigrationProgress> {
-        self.qmp
+        if self.copy.is_some() {
+            return self.copy_progress();
+        }
+        let qmp = self
+            .qmp
             .as_mut()
-            .context("migration_unsupported: QMP is not connected")?
-            .migration_progress()
+            .context("migration_unsupported: QMP is not connected")?;
+        let mut progress = qmp.migration_progress()?;
+        // A destination whose devices the source copies has the whole VM
+        // only once the source said their last blocks are written.
+        if !self.exports.is_empty() && progress.status == "completed" && !self.disk_synced {
+            progress.status = "active".to_string();
+            progress.phase = "syncing".to_string();
+        }
+        Ok(progress)
+    }
+
+    /// The block copy's phases, driven by each poll; the end is kept.
+    fn copy_progress(&mut self) -> Result<crate::migration::MigrationProgress> {
+        use crate::migration::MigrationProgress;
+        let qmp = self
+            .qmp
+            .as_mut()
+            .context("migration_unsupported: QMP is not connected")?;
+        let copy = self.copy.as_mut().expect("a copy is under way");
+        let active = |phase: &str, jobs: &[super::qmp::MirrorJob]| {
+            let (disk_transferred, disk_total) = copy_bytes(jobs);
+            MigrationProgress {
+                status: "active".to_string(),
+                disk_transferred,
+                disk_total,
+                phase: phase.to_string(),
+                ..Default::default()
+            }
+        };
+        loop {
+            match copy.phase.clone() {
+                CopyPhase::Ended(progress) => return Ok(progress),
+                CopyPhase::Copying => {
+                    let jobs = qmp.mirror_jobs()?;
+                    if copy.cancel_requested {
+                        for &index in &copy.indexes {
+                            let _ = qmp.mirror_cancel(index, true);
+                        }
+                        copy.phase = CopyPhase::Aborting("cancelled".to_string(), String::new());
+                        continue;
+                    }
+                    if let Some(failed) = jobs
+                        .iter()
+                        .find(|job| copy.indexes.contains(&job.index) && (job.concluded || !job.error.is_empty()))
+                    {
+                        let error = format!(
+                            "the copy of {} failed: {}",
+                            super::qmp::block_node_name(failed.index),
+                            failed.error
+                        );
+                        for &index in &copy.indexes {
+                            let _ = qmp.mirror_cancel(index, true);
+                        }
+                        copy.phase = CopyPhase::Aborting("failed".to_string(), error);
+                        continue;
+                    }
+                    let converged = copy
+                        .indexes
+                        .iter()
+                        .all(|index| jobs.iter().any(|job| job.index == *index && job.ready));
+                    if !converged {
+                        return Ok(active("copying", &jobs));
+                    }
+                    // The mirrors follow the guest's writes: the VM goes.
+                    let address = crate::migration::tcp_address(&copy.uri)?;
+                    let sent = connect_with_preface(&address, crate::migration::PREFACE_RAM)
+                        .and_then(|stream| qmp.migration_send(&stream, &copy.params));
+                    match sent {
+                        Ok(()) => copy.phase = CopyPhase::Ram,
+                        Err(error) => {
+                            for &index in &copy.indexes {
+                                let _ = qmp.mirror_cancel(index, true);
+                            }
+                            copy.phase = CopyPhase::Aborting(
+                                "failed".to_string(),
+                                format!("send the VM: {error:#}"),
+                            );
+                        }
+                    }
+                }
+                CopyPhase::Ram => {
+                    let mut progress = qmp.migration_progress()?;
+                    let jobs = qmp.mirror_jobs()?;
+                    let (disk_transferred, disk_total) = copy_bytes(&jobs);
+                    progress.disk_transferred = disk_transferred;
+                    progress.disk_total = disk_total;
+                    progress.phase = "ram".to_string();
+                    match progress.status.as_str() {
+                        "completed" => {
+                            // The guest is stopped here for good (return
+                            // path: the destination loaded the state). The
+                            // mirrors write their last blocks and end;
+                            // nothing pivots.
+                            for &index in &copy.indexes {
+                                if let Err(error) = qmp.mirror_cancel(index, false) {
+                                    warn!(sl!(), "end the copy of {}: {:?}", index, error);
+                                }
+                            }
+                            copy.phase = CopyPhase::Syncing;
+                        }
+                        "failed" | "cancelled" => {
+                            // QEMU resumed the VM here; the mirrors stop.
+                            for &index in &copy.indexes {
+                                let _ = qmp.mirror_cancel(index, true);
+                            }
+                            copy.phase =
+                                CopyPhase::Aborting(progress.status.clone(), progress.error.clone());
+                        }
+                        _ => return Ok(progress),
+                    }
+                }
+                CopyPhase::Syncing => {
+                    let jobs = qmp.mirror_jobs()?;
+                    let pending = copy
+                        .indexes
+                        .iter()
+                        .any(|index| jobs.iter().any(|job| job.index == *index && !job.concluded));
+                    if pending {
+                        return Ok(active("syncing", &jobs));
+                    }
+                    let (disk_transferred, disk_total) = copy_bytes(&jobs);
+                    let failed = jobs
+                        .iter()
+                        .find(|job| copy.indexes.contains(&job.index) && !job.error.is_empty())
+                        .cloned();
+                    for &index in &copy.indexes {
+                        qmp.mirror_dismiss(index);
+                    }
+                    let ram = qmp.migration_progress().unwrap_or_default();
+                    let mut ended = MigrationProgress {
+                        status: "failed".to_string(),
+                        transferred: ram.transferred,
+                        remaining: ram.remaining,
+                        total_ms: ram.total_ms,
+                        downtime_ms: ram.downtime_ms,
+                        disk_transferred,
+                        disk_total,
+                        phase: "syncing".to_string(),
+                        ..Default::default()
+                    };
+                    if let Some(job) = failed {
+                        // The destination's device misses the last blocks,
+                        // and it never resumes without the word: this VM
+                        // holds the whole root and runs on (one writer).
+                        ended.error = format!(
+                            "the last blocks of {} were not written to the destination: {}; the VM runs on here",
+                            super::qmp::block_node_name(job.index),
+                            job.error
+                        );
+                        if let Err(error) = qmp.qmp_cont() {
+                            error!(sl!(), "resume the VM whose copy failed: {:?}", error);
+                        }
+                    } else {
+                        let address = crate::migration::tcp_address(&copy.uri)?;
+                        match tell_synced(&address) {
+                            Told::Acknowledged => ended.status = "completed".to_string(),
+                            Told::NotReached(error) => {
+                                ended.error = format!(
+                                    "the destination was not told that the copy is written: {error}; the VM runs on here"
+                                );
+                                if let Err(error) = qmp.qmp_cont() {
+                                    error!(sl!(), "resume the VM the destination lost: {:?}", error);
+                                }
+                            }
+                            Told::Unknown(error) => {
+                                // The word may have arrived: the destination
+                                // may run the VM. Neither is resumed here;
+                                // the operator decides.
+                                ended.undecided = true;
+                                ended.error = format!(
+                                    "the destination's word on the copy was not read: {error}; neither VM is resumed"
+                                );
+                            }
+                        }
+                    }
+                    copy.phase = CopyPhase::Ended(ended);
+                }
+                CopyPhase::Aborting(status, error) => {
+                    let jobs = qmp.mirror_jobs()?;
+                    let pending = copy
+                        .indexes
+                        .iter()
+                        .any(|index| jobs.iter().any(|job| job.index == *index && !job.concluded));
+                    if pending {
+                        return Ok(active("copying", &jobs));
+                    }
+                    let (disk_transferred, disk_total) = copy_bytes(&jobs);
+                    for &index in &copy.indexes {
+                        qmp.mirror_dismiss(index);
+                    }
+                    copy.phase = CopyPhase::Ended(MigrationProgress {
+                        status,
+                        error,
+                        disk_transferred,
+                        disk_total,
+                        ..Default::default()
+                    });
+                }
+            }
+        }
     }
 
     pub(crate) fn migration_cancel(&mut self) -> Result<()> {
+        if let Some(copy) = self.copy.as_mut() {
+            match copy.phase {
+                CopyPhase::Copying => {
+                    // The next poll stops the mirrors; the VM never left.
+                    copy.cancel_requested = true;
+                    return Ok(());
+                }
+                CopyPhase::Ram => {}
+                // Too late: the guest is stopped here and the destination
+                // has the state; the copy's end decides.
+                _ => return Ok(()),
+            }
+        }
         self.qmp
             .as_mut()
             .context("migration_unsupported: QMP is not connected")?
             .migration_cancel()
+    }
+
+    /// The destination: export the devices the source copies, on a unix
+    /// socket of the sandbox the shim bridges to. None without a copy.
+    pub(crate) fn migration_exports_start(&mut self) -> Result<Option<String>> {
+        let indexes = self
+            .incoming
+            .as_ref()
+            .context("migration_invalid: this VM does not receive a migration")?
+            .copied_indexes();
+        if indexes.is_empty() || !self.exports.is_empty() {
+            return Ok(self.nbd_socket.clone());
+        }
+        let socket = format!("{}/nbd.sock", crate::utils::get_sandbox_path(&self.id));
+        let _ = std::fs::remove_file(&socket);
+        self.qmp
+            .as_mut()
+            .context("migration_unsupported: QMP is not connected")?
+            .nbd_exports_start(&socket, &indexes)?;
+        self.exports = indexes;
+        self.nbd_socket = Some(socket.clone());
+        Ok(Some(socket))
+    }
+
+    /// The source said the copied blocks are all written.
+    pub(crate) fn mark_disk_synced(&mut self) {
+        self.disk_synced = true;
+    }
+
+    /// The exports end before the VM runs here.
+    pub(crate) fn migration_exports_stop(&mut self) -> Result<()> {
+        if self.exports.is_empty() {
+            return Ok(());
+        }
+        let indexes = std::mem::take(&mut self.exports);
+        let result = self
+            .qmp
+            .as_mut()
+            .context("migration_unsupported: QMP is not connected")?
+            .nbd_exports_stop(&indexes);
+        if let Some(socket) = self.nbd_socket.take() {
+            let _ = std::fs::remove_file(socket);
+        }
+        result
     }
 
     /// The listener of the migration this VM receives, bound in the host's
@@ -793,6 +1200,10 @@ impl QemuInner {
     }
 
     pub(crate) fn resume_vm(&mut self) -> Result<()> {
+        // Nova Kata (ADR-052): a device exported for the source's copy is
+        // the guest's alone once it runs.
+        self.migration_exports_stop()
+            .context("end the exports before the resume")?;
         let qmp = self.qmp.as_mut().ok_or(anyhow!("qmp not initialized"))?;
         qmp.qmp_cont().context("resume vm")
     }
@@ -1607,6 +2018,10 @@ impl Persist for QemuInner {
 
             exit_notify: Some(exit_notify),
             incoming: None,
+            copy: None,
+            exports: Vec::new(),
+            nbd_socket: None,
+            disk_synced: false,
         })
     }
 }

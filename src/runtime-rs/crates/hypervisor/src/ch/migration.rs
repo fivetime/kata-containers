@@ -410,6 +410,11 @@ impl CloudHypervisorInner {
         if self.transfer_active() {
             return Err(anyhow!("migration_invalid: a migration is under way"));
         }
+        if !params.copy.is_empty() {
+            return Err(anyhow!(
+                "migration_unsupported: Cloud Hypervisor copies no block device; only a Cinder root migrates under it"
+            ));
+        }
         if params.downtime_ms != 0 {
             info!(
                 sl!(),
@@ -474,6 +479,11 @@ impl CloudHypervisorInner {
             .context("migration_invalid: this VM does not receive a migration")?;
         if self.state != VmmState::VmmServerReady {
             return Err(anyhow!("migration_invalid: the VMM is not started"));
+        }
+        if !incoming.copied_indexes().is_empty() {
+            return Err(anyhow!(
+                "migration_unsupported: Cloud Hypervisor exports no block device for a copy"
+            ));
         }
         if self.transfer.is_some() {
             return Ok(());

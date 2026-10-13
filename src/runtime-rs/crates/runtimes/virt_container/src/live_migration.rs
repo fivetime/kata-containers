@@ -32,6 +32,10 @@ pub struct MigrationUpdate {
     pub downtime_ms: Option<u64>,
     #[serde(default)]
     pub max_bandwidth: Option<u64>,
+    /// send: the indexes of the block devices mirrored into the
+    /// destination's before the VM is sent.
+    #[serde(default)]
+    pub copy: Option<Vec<u64>>,
 }
 
 fn canonical_uuid(value: &str) -> bool {
@@ -94,7 +98,10 @@ pub fn parse(req: &UpdateRequest) -> Result<Option<MigrationUpdate>> {
         .context("migration_invalid: instance identity")?;
     match value.action.as_str() {
         "manifest" => {
-            if value.uri.is_some() || value.downtime_ms.is_some() || value.max_bandwidth.is_some()
+            if value.uri.is_some()
+                || value.downtime_ms.is_some()
+                || value.max_bandwidth.is_some()
+                || value.copy.is_some()
             {
                 bail!("migration_invalid: a manifest names a path only");
             }
@@ -103,12 +110,19 @@ pub fn parse(req: &UpdateRequest) -> Result<Option<MigrationUpdate>> {
         "send" => {
             validate_path(&req.container_id, value.path.as_deref().unwrap_or(""))?;
             hypervisor::migration::validate_tcp_uri(value.uri.as_deref().unwrap_or(""))?;
+            if let Some(copy) = value.copy.as_ref() {
+                let unique: std::collections::HashSet<&u64> = copy.iter().collect();
+                if copy.len() > 256 || unique.len() != copy.len() {
+                    bail!("migration_invalid: the devices copied");
+                }
+            }
         }
         "cancel" | "pause" => {
             if value.path.is_some()
                 || value.uri.is_some()
                 || value.downtime_ms.is_some()
                 || value.max_bandwidth.is_some()
+                || value.copy.is_some()
             {
                 bail!("migration_invalid: a cancel or a pause names nothing");
             }
@@ -183,6 +197,20 @@ mod tests {
         let got = parse(&request(&send)).unwrap().unwrap();
         assert_eq!(got.action, "send");
         assert_eq!(got.downtime_ms, Some(300));
+        assert_eq!(got.copy, None);
+        // A send that copies a block device first (a local root).
+        let copied = format!(
+            r#"{{"action":"send","generation":"g","request_id":"{REQ}",
+               "path":"{MIGRATION_DIR}/{CID}.status","uri":"tcp:10.0.0.2:47000",
+               "copy":[1]}}"#
+        );
+        assert_eq!(parse(&request(&copied)).unwrap().unwrap().copy, Some(vec![1]));
+        let twice = copied.replace("[1]", "[1,1]");
+        assert!(parse(&request(&twice)).is_err());
+        let cancel = format!(
+            r#"{{"action":"cancel","generation":"g","request_id":"{REQ}","copy":[1]}}"#
+        );
+        assert!(parse(&request(&cancel)).is_err());
         let manifest = format!(
             r#"{{"action":"manifest","generation":"g","request_id":"{REQ}",
                "path":"{MIGRATION_DIR}/{CID}.manifest"}}"#
@@ -239,6 +267,7 @@ mod tests {
             uri: None,
             downtime_ms: None,
             max_bandwidth: None,
+            copy: None,
         };
         let own = HashMap::from([(GENERATION_KEY.to_string(), "g1".to_string())]);
         validate_generation(&update, &own).unwrap();
