@@ -143,8 +143,11 @@ fn connect_with_preface(
 }
 
 /// Tell the destination that the copied blocks are all written, and read
-/// its acknowledgement.
-fn tell_synced(address: &std::net::SocketAddr) -> Told {
+/// its acknowledgement. With TLS the word is said only once the
+/// destination's certificate was verified, and the destination takes it
+/// only of a source of the CA (migration_tls): nothing else on the
+/// migration network can resume a VM before its blocks are written.
+fn tell_synced(address: &std::net::SocketAddr, tls: bool) -> Told {
     use std::io::{Read, Write};
     let mut stream = match std::net::TcpStream::connect_timeout(address, COPY_CONNECT_TIMEOUT) {
         Ok(stream) => stream,
@@ -155,8 +158,23 @@ fn tell_synced(address: &std::net::SocketAddr) -> Told {
         return Told::Unknown(format!("the word to {address}: {error}"));
     }
     let _ = stream.set_read_timeout(Some(SYNCED_ACK_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(SYNCED_ACK_TIMEOUT));
     let mut answer = [0u8; 3];
-    match stream.read_exact(&mut answer) {
+    let read = if tls {
+        // A handshake that fails says nothing to the destination: it never
+        // resumes without the word.
+        match crate::migration_tls::connect_blocking(
+            stream,
+            address.ip(),
+            std::path::Path::new(crate::migration_tls::TLS_DIR),
+        ) {
+            Ok(mut secure) => secure.read_exact(&mut answer),
+            Err(error) => return Told::NotReached(format!("the TLS of {address}: {error:#}")),
+        }
+    } else {
+        stream.read_exact(&mut answer)
+    };
+    match read {
         Ok(()) if answer == crate::migration::PREFACE_ACK => Told::Acknowledged,
         Ok(()) => Told::Unknown(format!("the answer of {address}: {answer:?}")),
         Err(error) => Told::Unknown(format!("the answer of {address}: {error}")),
@@ -219,6 +237,14 @@ impl QemuInner {
             .qmp
             .as_mut()
             .context("migration_unsupported: QMP is not connected")?;
+        // TLS, as libvirt's native TLS: QEMU's own on the VM's and the
+        // copy's streams, of libvirt's certificates; the destination's
+        // certificate must name the address the source connects to.
+        let tls_hostname = params.tls.then(|| address.ip().to_string());
+        if params.tls {
+            crate::migration_tls::check(std::path::Path::new(crate::migration_tls::TLS_DIR))?;
+            qmp.migration_tls(false, tls_hostname.as_deref())?;
+        }
         // The shim runs in the host's network namespace, QEMU in the
         // sandbox's: the shim connects, QEMU gets the connection.
         if params.copy.is_empty() {
@@ -233,8 +259,11 @@ impl QemuInner {
         indexes.dedup();
         let mut started = Vec::new();
         for &index in &indexes {
-            let result = connect_with_preface(&address, crate::migration::PREFACE_NBD)
-                .and_then(|stream| qmp.mirror_start(index, &stream, params.max_bandwidth));
+            let result = connect_with_preface(&address, crate::migration::PREFACE_NBD).and_then(
+                |stream| {
+                    qmp.mirror_start(index, &stream, params.max_bandwidth, tls_hostname.as_deref())
+                },
+            );
             if let Err(error) = result {
                 for &done in &started {
                     let _ = qmp.mirror_cancel(done, true);
@@ -436,7 +465,7 @@ impl QemuInner {
                         }
                     } else {
                         let address = crate::migration::tcp_address(&copy.uri)?;
-                        match tell_synced(&address) {
+                        match tell_synced(&address, copy.params.tls) {
                             Told::Acknowledged => ended.status = "completed".to_string(),
                             Told::NotReached(error) => {
                                 ended.error = format!(
@@ -504,14 +533,32 @@ impl QemuInner {
             .migration_cancel()
     }
 
-    /// The destination: export the devices the source copies, on a unix
-    /// socket of the sandbox the shim bridges to. None without a copy.
-    pub(crate) fn migration_exports_start(&mut self) -> Result<Option<String>> {
-        let indexes = self
+    /// The destination: whether the migration is TLS, its certificates
+    /// checked and QEMU's credentials made, before anything is accepted.
+    pub(crate) fn migration_incoming_tls(&mut self) -> Result<bool> {
+        let tls = self
             .incoming
             .as_ref()
             .context("migration_invalid: this VM does not receive a migration")?
-            .copied_indexes();
+            .tls;
+        if tls {
+            crate::migration_tls::check(std::path::Path::new(crate::migration_tls::TLS_DIR))?;
+            self.qmp
+                .as_mut()
+                .context("migration_unsupported: QMP is not connected")?
+                .migration_tls(true, None)?;
+        }
+        Ok(tls)
+    }
+
+    /// The destination: export the devices the source copies, on a unix
+    /// socket of the sandbox the shim bridges to. None without a copy.
+    pub(crate) fn migration_exports_start(&mut self) -> Result<Option<String>> {
+        let incoming = self
+            .incoming
+            .as_ref()
+            .context("migration_invalid: this VM does not receive a migration")?;
+        let (indexes, tls) = (incoming.copied_indexes(), incoming.tls);
         if indexes.is_empty() || !self.exports.is_empty() {
             return Ok(self.nbd_socket.clone());
         }
@@ -520,7 +567,7 @@ impl QemuInner {
         self.qmp
             .as_mut()
             .context("migration_unsupported: QMP is not connected")?
-            .nbd_exports_start(&socket, &indexes)?;
+            .nbd_exports_start(&socket, &indexes, tls)?;
         self.exports = indexes;
         self.nbd_socket = Some(socket.clone());
         Ok(Some(socket))

@@ -36,6 +36,9 @@ pub struct MigrationUpdate {
     /// destination's before the VM is sent.
     #[serde(default)]
     pub copy: Option<Vec<u64>>,
+    /// send: every connection is TLS (libvirt's native TLS).
+    #[serde(default)]
+    pub tls: Option<bool>,
 }
 
 fn canonical_uuid(value: &str) -> bool {
@@ -102,6 +105,7 @@ pub fn parse(req: &UpdateRequest) -> Result<Option<MigrationUpdate>> {
                 || value.downtime_ms.is_some()
                 || value.max_bandwidth.is_some()
                 || value.copy.is_some()
+                || value.tls.is_some()
             {
                 bail!("migration_invalid: a manifest names a path only");
             }
@@ -123,6 +127,7 @@ pub fn parse(req: &UpdateRequest) -> Result<Option<MigrationUpdate>> {
                 || value.downtime_ms.is_some()
                 || value.max_bandwidth.is_some()
                 || value.copy.is_some()
+                || value.tls.is_some()
             {
                 bail!("migration_invalid: a cancel or a pause names nothing");
             }
@@ -268,6 +273,7 @@ mod tests {
             downtime_ms: None,
             max_bandwidth: None,
             copy: None,
+            tls: None,
         };
         let own = HashMap::from([(GENERATION_KEY.to_string(), "g1".to_string())]);
         validate_generation(&update, &own).unwrap();

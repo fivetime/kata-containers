@@ -34,6 +34,9 @@ crossbeam-channel = "0.5.6"
 qapi = { version = "0.15", features = ["qmp", "async-tokio-all"] }
 qapi-spec = "0.3.2"
 qapi-qmp = "0.15.0"
+# Nova Kata (ADR-052): TLS of a live migration's connections.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 bytes = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }

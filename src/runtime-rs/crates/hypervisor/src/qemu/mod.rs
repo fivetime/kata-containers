@@ -169,18 +169,26 @@ impl Hypervisor for Qemu {
     /// written. A source that never connects leaves the VM waiting until
     /// the destination's rollback deletes it.
     async fn migration_receive(&self) -> Result<()> {
-        let (listener, nbd_socket) = {
+        let (listener, nbd_socket, tls) = {
             let mut inner = self.inner.write().await;
             let listener = inner.migration_listen()?;
+            let tls = if inner.migration_incoming_tls()? {
+                Some(crate::migration_tls::server_config(std::path::Path::new(
+                    crate::migration_tls::TLS_DIR,
+                ))?)
+            } else {
+                None
+            };
             let nbd_socket = inner.migration_exports_start()?;
-            (listener, nbd_socket)
+            (listener, nbd_socket, tls)
         };
         listener
             .set_nonblocking(true)
             .context("migration_failed: the listener")?;
         let listener =
             tokio::net::TcpListener::from_std(listener).context("migration_failed: the listener")?;
-        let accepting = tokio::spawn(accept_migration(listener, self.inner.clone(), nbd_socket));
+        let accepting =
+            tokio::spawn(accept_migration(listener, self.inner.clone(), nbd_socket, tls));
         let inner = self.inner.clone();
         tokio::spawn(async move {
             // Nova Kata (ADR-052): the VM is resumed the moment QEMU reports
@@ -346,6 +354,7 @@ async fn accept_migration(
     listener: tokio::net::TcpListener,
     inner: Arc<RwLock<QemuInner>>,
     nbd_socket: Option<String>,
+    tls: Option<Arc<rustls::ServerConfig>>,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     // The first connection of any kind must come in time; the VM's own
@@ -438,11 +447,38 @@ async fn accept_migration(
             }
             _ => {
                 // The copied blocks are all written: the VM is whole here.
-                inner.write().await.mark_disk_synced();
-                if let Err(error) = stream.write_all(crate::migration::PREFACE_ACK).await {
-                    warn!(sl!(), "acknowledge the copy's end to {}: {:?}", peer, error);
+                // With TLS only a source of the CA says so; anything else
+                // is dropped and the VM waits.
+                if let Some(config) = tls.clone() {
+                    let acceptor = tokio_rustls::TlsAcceptor::from(config);
+                    let mut secure = match tokio::time::timeout(
+                        MIGRATION_PREFACE_TIMEOUT,
+                        acceptor.accept(stream),
+                    )
+                    .await
+                    {
+                        Ok(Ok(secure)) => secure,
+                        Ok(Err(error)) => {
+                            warn!(sl!(), "the word from {} is refused: {:?}", peer, error);
+                            continue;
+                        }
+                        Err(_) => {
+                            warn!(sl!(), "the word from {} came with no TLS in time", peer);
+                            continue;
+                        }
+                    };
+                    inner.write().await.mark_disk_synced();
+                    if let Err(error) = secure.write_all(crate::migration::PREFACE_ACK).await {
+                        warn!(sl!(), "acknowledge the copy's end to {}: {:?}", peer, error);
+                    }
+                    let _ = secure.shutdown().await;
+                } else {
+                    inner.write().await.mark_disk_synced();
+                    if let Err(error) = stream.write_all(crate::migration::PREFACE_ACK).await {
+                        warn!(sl!(), "acknowledge the copy's end to {}: {:?}", peer, error);
+                    }
+                    let _ = stream.shutdown().await;
                 }
-                let _ = stream.shutdown().await;
                 info!(sl!(), "the source says the copied blocks are written");
             }
         }

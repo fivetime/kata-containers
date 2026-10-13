@@ -172,15 +172,19 @@ where
 }
 
 /// Copy both ways until either side ends. On the source the requests come
-/// from the VMM's unix connection; on the destination from the TCP peer.
-async fn bridge(
-    tcp: TcpStream,
+/// from the VMM's unix connection; on the destination from the TCP peer,
+/// which TLS may wrap (migration_tls: Cloud Hypervisor has none of its own,
+/// the shim ends it).
+async fn bridge<S>(
+    tcp: S,
     unix: UnixStream,
     transfer: Transfer,
     source: bool,
     max_bandwidth: u64,
-) {
-    let (tcp_read, tcp_write) = tcp.into_split();
+) where
+    S: AsyncRead + AsyncWrite + Send + 'static,
+{
+    let (tcp_read, tcp_write) = tokio::io::split(tcp);
     let (unix_read, unix_write) = unix.into_split();
     let (requests, responses) = if source {
         tokio::join!(
@@ -210,6 +214,7 @@ pub(crate) async fn send(
     uri: &str,
     transfer: Transfer,
     max_bandwidth: u64,
+    tls: bool,
 ) -> Result<(JoinHandle<()>, JoinHandle<()>)> {
     let address = tcp_address(uri)?;
     let std_tcp = std::net::TcpStream::connect_timeout(&address, CONNECT_TIMEOUT)
@@ -218,6 +223,24 @@ pub(crate) async fn send(
         .set_nonblocking(true)
         .context("migration_failed: the connection")?;
     let tcp = TcpStream::from_std(std_tcp).context("migration_failed: the connection")?;
+    // With TLS the handshake is the send's, before the VMM is asked to
+    // send: a destination whose certificate does not verify gets nothing.
+    let tcp: Box<dyn Stream> = if tls {
+        let config = crate::migration_tls::client_config(std::path::Path::new(
+            crate::migration_tls::TLS_DIR,
+        ))?;
+        let secure = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            tokio_rustls::TlsConnector::from(config)
+                .connect(crate::migration_tls::server_name(address.ip()), tcp),
+        )
+        .await
+        .map_err(|_| anyhow!("migration_failed: the TLS of {address} timed out"))?
+        .with_context(|| format!("migration_failed: the TLS of {address}"))?;
+        Box::new(secure)
+    } else {
+        Box::new(tcp)
+    };
     let path = socket_path(id, OUT_SOCKET);
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)
@@ -288,8 +311,18 @@ pub(crate) async fn receive(
     api_socket_path: String,
     uri: &str,
     transfer: Transfer,
+    tls: bool,
 ) -> Result<(JoinHandle<()>, JoinHandle<()>)> {
     let address = tcp_address(uri)?;
+    // The certificates are read now: a destination without them fails its
+    // create, before the source sends anything.
+    let tls = if tls {
+        Some(crate::migration_tls::server_config(std::path::Path::new(
+            crate::migration_tls::TLS_DIR,
+        ))?)
+    } else {
+        None
+    };
     let std_listener = std::net::TcpListener::bind(address)
         .with_context(|| format!("migration_failed: listen on {address}"))?;
     std_listener
@@ -331,10 +364,38 @@ pub(crate) async fn receive(
     let bridge_transfer = transfer.clone();
     let accept_task = tokio::spawn(async move {
         let accepted = tokio::time::timeout(ACCEPT_TIMEOUT, listener.accept()).await;
-        let tcp = match accepted {
+        let tcp: Box<dyn Stream> = match accepted {
             Ok(Ok((stream, peer))) => {
                 info!(sl!(), "the migration connected from {}", peer);
-                stream
+                match tls {
+                    Some(config) => {
+                        let accepted = tokio::time::timeout(
+                            CONNECT_TIMEOUT,
+                            tokio_rustls::TlsAcceptor::from(config).accept(stream),
+                        )
+                        .await;
+                        match accepted {
+                            Ok(Ok(secure)) => Box::new(secure),
+                            Ok(Err(error)) => {
+                                set_status(
+                                    &bridge_transfer,
+                                    "failed",
+                                    format!("the migration's TLS from {peer}: {error}"),
+                                );
+                                return;
+                            }
+                            Err(_) => {
+                                set_status(
+                                    &bridge_transfer,
+                                    "failed",
+                                    format!("the migration's TLS from {peer} timed out"),
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    None => Box::new(stream),
+                }
             }
             Ok(Err(error)) => {
                 set_status(
@@ -372,6 +433,10 @@ pub(crate) async fn receive(
     });
     Ok((accept_task, api_task))
 }
+
+/// A migration's connection, TLS or not.
+trait Stream: AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> Stream for T {}
 
 pub(crate) fn unsupported(what: &str) -> anyhow::Error {
     anyhow!("migration_unsupported: Cloud Hypervisor {what}")
@@ -429,6 +494,7 @@ impl CloudHypervisorInner {
             uri,
             transfer.clone(),
             params.max_bandwidth,
+            params.tls,
         )
         .await?;
         self.bridge = Some(bridge.abort_handle());
@@ -494,6 +560,7 @@ impl CloudHypervisorInner {
             get_api_socket_path(&self.id)?,
             &incoming.uri,
             transfer.clone(),
+            incoming.tls,
         )
         .await?;
         self.migration_tasks.push(accept);

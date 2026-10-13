@@ -1183,6 +1183,7 @@ impl Sandbox for VirtSandbox {
                     downtime_ms: update.downtime_ms.unwrap_or(0),
                     max_bandwidth: update.max_bandwidth.unwrap_or(0),
                     copy: update.copy.clone().unwrap_or_default(),
+                    tls: update.tls.unwrap_or(false),
                 };
                 // The agent stops answering when the VM leaves: the health
                 // check must not end the shim meanwhile.

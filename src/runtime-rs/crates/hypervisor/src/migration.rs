@@ -80,6 +80,10 @@ pub struct MigrateIn {
     /// which the transfer carries): it is adopted as paused.
     #[serde(default)]
     pub paused: bool,
+    /// Every connection of the migration is TLS, with the certificates of
+    /// migration_tls::TLS_DIR (libvirt's native TLS).
+    #[serde(default)]
+    pub tls: bool,
 }
 
 impl MigrateIn {
@@ -215,6 +219,9 @@ pub struct MigrationParams {
     /// before the VM is sent (the manifest's `copy` devices).
     #[serde(default)]
     pub copy: Vec<u64>,
+    /// Every connection of the migration is TLS (migration_tls).
+    #[serde(default)]
+    pub tls: bool,
 }
 
 /// How a transfer stands, on the side that asks.
