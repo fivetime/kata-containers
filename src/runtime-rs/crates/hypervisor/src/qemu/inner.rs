@@ -2225,7 +2225,9 @@ impl QemuInner {
         // through the QMP operation. Never remap or resize the storage backend.
         let source = &device.config.path_on_host;
         let file = std::fs::OpenOptions::new().read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(source)?;
+            // The path is the gateway's stable alias of the mapping, a link:
+            // the device is held to its identity by its numbers below.
+            .custom_flags(libc::O_CLOEXEC).open(source)?;
         let metadata = file.metadata()?;
         if !metadata.file_type().is_block_device()
             || libc::major(metadata.rdev()) as i64 != device.config.major

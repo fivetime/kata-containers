@@ -438,7 +438,9 @@ impl DragonballInner {
         let source = &device.config.path_on_host;
         let file = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            // The path is the gateway's stable alias of the mapping, a link:
+            // the device is held to its identity by its numbers below.
+            .custom_flags(libc::O_CLOEXEC)
             .open(source)?;
         let metadata = file.metadata()?;
         if !metadata.file_type().is_block_device()
