@@ -10,11 +10,16 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::os::fd::AsRawFd;
 use std::path::{Component, Path};
+use std::time::Duration;
 
 nix::ioctl_read!(blk_get_size64, 0x12, 114, u64);
 nix::ioctl_write_ptr!(ext4_resize_fs, b'f', 16, u64);
 
 const SHARED_CONTAINERS: &str = "/run/kata-containers/shared/containers/";
+// The guest learns a grown disk from a configuration change interrupt, which
+// its virtio-blk driver handles after the VMM has replied.
+const DEVICE_GROWTH_WAIT: Duration = Duration::from_secs(10);
+const DEVICE_GROWTH_POLL: Duration = Duration::from_millis(100);
 
 fn validate(path: &str, size: u64) -> Result<()> {
     let guest = Path::new(path);
@@ -42,7 +47,14 @@ fn blocks_of(size: u64, block_size: u64) -> Result<u64> {
     Ok(size / block_size)
 }
 
-pub fn resize_volume(path: &str, size: u64) -> Result<()> {
+fn device_size(device: &std::fs::File) -> Result<u64> {
+    let mut bytes = 0_u64;
+    unsafe { blk_get_size64(device.as_raw_fd(), &mut bytes) }
+        .context("resize_volume: read the device size")?;
+    Ok(bytes)
+}
+
+pub async fn resize_volume(path: &str, size: u64) -> Result<()> {
     validate(path, size)?;
     let mount = kata_sys_util::mount::get_linux_mount_info(path)
         .map_err(|e| anyhow!("resize_volume: {path} is not mounted: {e}"))?;
@@ -51,11 +63,16 @@ pub fn resize_volume(path: &str, size: u64) -> Result<()> {
     }
     let device = std::fs::File::open(&mount.device)
         .with_context(|| format!("resize_volume: open {}", mount.device))?;
-    let mut device_bytes = 0_u64;
-    unsafe { blk_get_size64(device.as_raw_fd(), &mut device_bytes) }
-        .context("resize_volume: read the device size")?;
-    if device_bytes < size {
-        bail!("resize_volume: the device has {device_bytes} bytes, not {size}");
+    let deadline = tokio::time::Instant::now() + DEVICE_GROWTH_WAIT;
+    loop {
+        let device_bytes = device_size(&device)?;
+        if device_bytes >= size {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("resize_volume: the device has {device_bytes} bytes, not {size}");
+        }
+        tokio::time::sleep(DEVICE_GROWTH_POLL).await;
     }
     let root = std::fs::File::open(path).with_context(|| format!("resize_volume: open {path}"))?;
     let stat = nix::sys::statfs::fstatfs(&root).context("resize_volume: statfs")?;

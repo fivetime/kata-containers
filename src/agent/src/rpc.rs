@@ -1912,6 +1912,7 @@ impl agent_ttrpc::AgentService for AgentService {
 
         // Nova Kata (openstack-nova-kata ADR-032).
         crate::nova_resize::resize_volume(&req.volume_guest_path, req.size)
+            .await
             .map_ttrpc_err(same)?;
         Ok(Empty::new())
     }
