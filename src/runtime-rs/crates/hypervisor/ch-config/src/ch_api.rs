@@ -197,6 +197,26 @@ pub async fn cloud_hypervisor_vm_blockdev_add(
     api_command(api_socket, "PUT", "vm.add-disk", Some(body), None).await
 }
 
+// Nova Kata: the guest is shown the size its host block device was grown
+// to by its owner (the patched VMM reads it, it never truncates a device).
+#[derive(Clone, Deserialize, Serialize, Default, Debug)]
+pub struct VmResizeDiskData {
+    pub id: String,
+    pub desired_size: u64,
+}
+
+pub async fn cloud_hypervisor_vm_resize_disk(
+    api_socket: &ApiSocket,
+    id: &str,
+    desired_size: u64,
+) -> Result<Option<String>> {
+    let body = serde_json::to_string(&VmResizeDiskData {
+        id: id.to_string(),
+        desired_size,
+    })?;
+    api_command(api_socket, "PUT", "vm.resize-disk", Some(body), None).await
+}
+
 pub async fn cloud_hypervisor_vm_netdev_add(
     api_socket: &ApiSocket,
     net_config: NetConfig,

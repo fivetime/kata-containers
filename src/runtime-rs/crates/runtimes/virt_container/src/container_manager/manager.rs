@@ -456,6 +456,12 @@ impl ContainerManager for VirtContainerManager {
                 .ok_or_else(|| Error::ContainerNotFound(req.container_id.clone()))?;
             return container.update_live_network(update).await;
         }
+        if let Some(growth) = super::root_growth::parse(&req)? {
+            let containers = self.containers.read().await;
+            let container = containers.get(&req.container_id)
+                .ok_or_else(|| Error::ContainerNotFound(req.container_id.clone()))?;
+            return container.grow_root(growth).await;
+        }
         if let Some(growth) = super::live_volume_growth::parse(&req)? {
             let containers = self.containers.read().await;
             let container = containers.get(&req.container_id)

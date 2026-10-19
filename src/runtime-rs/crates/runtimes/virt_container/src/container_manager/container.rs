@@ -1546,6 +1546,54 @@ impl Container {
     }
 }
 
+// Nova Kata (openstack-nova-kata ADR-032).
+impl Container {
+    /// Grow the running container's root: the VMM shows the guest the size
+    /// its host device was grown to, and the agent grows its filesystem in
+    /// the guest. Both steps take the size they are given again.
+    pub async fn grow_root(&self, growth: super::root_growth::RootGrowth) -> Result<()> {
+        let inner = self.inner.write().await;
+        inner
+            .check_state(vec![ProcessStatus::Running])
+            .await
+            .context("rootfs_update_conflict: the container does not run")?;
+        let manager = self.resource_manager.get_device_manager().await;
+        if !manager.read().await.supports_block_growth() {
+            return Err(anyhow!("rootfs_update_unsupported: hypervisor block growth unavailable"));
+        }
+        let mut roots = Vec::new();
+        for rootfs in &inner.rootfs {
+            if let Some(device_id) = rootfs.get_device_id().await? {
+                roots.push((device_id, rootfs.get_guest_rootfs_path().await?));
+            }
+        }
+        let [(device_id, guest_path)] = roots.as_slice() else {
+            return Err(anyhow!("rootfs_update_unsupported: the container has not one block root"));
+        };
+        info!(
+            self.logger,
+            "root growth {} of {} to {} bytes",
+            growth.request_id,
+            self.container_id.container_id,
+            growth.requested_bytes
+        );
+        manager
+            .write()
+            .await
+            .grow_block_device(device_id, growth.requested_bytes)
+            .await
+            .context("rootfs_update_failed: grow the root device")?;
+        self.agent
+            .resize_volume(agent::ResizeVolumeRequest {
+                volume_guest_path: guest_path.clone(),
+                size: growth.requested_bytes,
+            })
+            .await
+            .context("rootfs_update_failed: grow the root filesystem")?;
+        Ok(())
+    }
+}
+
 // Nova Kata (ADR-044).
 impl Container {
     pub async fn update_live_network(

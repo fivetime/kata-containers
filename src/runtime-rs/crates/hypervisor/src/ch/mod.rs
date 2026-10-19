@@ -25,6 +25,7 @@ macro_rules! sl {
 
 mod inner;
 mod inner_device;
+mod inner_growth;
 mod inner_hypervisor;
 mod migration;
 mod utils;
@@ -156,6 +157,13 @@ impl Hypervisor for CloudHypervisor {
 
     fn supports_network_removal(&self) -> bool {
         true
+    }
+    fn supports_block_growth(&self) -> bool {
+        true
+    }
+    async fn grow_block_device(&self, device: DeviceType, requested: u64) -> Result<()> {
+        let mut inner = self.inner.write().await;
+        inner.grow_block_device(device, requested).await
     }
     async fn remove_network_device(&self, device: crate::NetworkDevice) -> Result<()> {
         let mut inner = self.inner.write().await;

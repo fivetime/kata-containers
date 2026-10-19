@@ -51,6 +51,7 @@ mod mount;
 mod namespace;
 mod netlink;
 mod network;
+mod nova_resize;
 mod passfd_io;
 mod pci;
 pub mod random;

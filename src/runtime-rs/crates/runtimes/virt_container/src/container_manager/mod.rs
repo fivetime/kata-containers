@@ -7,6 +7,7 @@
 mod live_network;
 mod live_volume;
 mod live_volume_growth;
+mod root_growth;
 mod live_volume_created;
 mod container;
 use container::{Container, Exec};

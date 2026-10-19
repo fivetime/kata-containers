@@ -1910,10 +1910,10 @@ impl agent_ttrpc::AgentService for AgentService {
         trace_rpc_call!(ctx, "resize_volume", req);
         is_allowed(&req).await?;
 
-        Err(ttrpc_error(
-            ttrpc::Code::UNIMPLEMENTED,
-            "resize_volume is not implemented in kata-agent",
-        ))
+        // Nova Kata (openstack-nova-kata ADR-032).
+        crate::nova_resize::resize_volume(&req.volume_guest_path, req.size)
+            .map_ttrpc_err(same)?;
+        Ok(Empty::new())
     }
 
     async fn add_swap(
