@@ -251,7 +251,10 @@ impl VirtSandbox {
             exit_status,
             exited_at: Some(exited_at),
         });
-        let _ = self.exit_notify_tx.send(true);
+        // Nova Kata (kata-containers#13919): send() drops the value when no
+        // receiver exists, and wait() subscribes after it read the state, so
+        // a waiter that subscribes after the stop would wait for ever.
+        self.exit_notify_tx.send_replace(true);
     }
 
     #[instrument]
