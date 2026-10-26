@@ -83,33 +83,9 @@ async fn handle_block_storage(
         if options.should_create_filesystem {
             ensure_block_filesystem(logger, storage).await?;
         }
-        let mut storage = storage.clone();
-        storage.source = block_mount_alias(BLOCK_MOUNT_ALIAS_DIR, &storage.source, dev_num)?;
-        let path = common_storage_handler(logger, &storage)?;
+        let path = common_storage_handler(logger, storage)?;
         new_device(path)
     }
-}
-
-/// Nova Kata: the names the agent mounts block storages by. A container's
-/// /proc/self/mountinfo shows a mount's source as it was given, and the
-/// guest kernel's name of a disk (/dev/vdb, the container's root) is in the
-/// container the node of another disk, which its /dev holds at the name
-/// Nova gave that disk. Mounted by a link of its own, the root no longer
-/// passes for that disk.
-const BLOCK_MOUNT_ALIAS_DIR: &str = "/run/kata-containers/block";
-
-fn block_mount_alias(dir: &str, device: &str, dev_num: &str) -> Result<String> {
-    if !device.starts_with("/dev/") {
-        return Ok(device.to_string());
-    }
-    fs::create_dir_all(dir).with_context(|| format!("create {}", dir))?;
-    let alias = Path::new(dir).join(dev_num.replace(':', "-"));
-    if alias.symlink_metadata().is_ok() {
-        fs::remove_file(&alias).with_context(|| format!("remove {}", alias.display()))?;
-    }
-    std::os::unix::fs::symlink(device, &alias)
-        .with_context(|| format!("link {} to {}", alias.display(), device))?;
-    Ok(alias.display().to_string())
 }
 
 fn block_storage_driver_options(storage: &Storage) -> Result<BlockStorageDriverOptions> {
@@ -189,26 +165,6 @@ async fn ensure_ext4_filesystem(logger: &Logger, source: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_block_storage_is_mounted_by_an_alias_not_the_kernel_name() {
-        let dir = tempfile::tempdir().unwrap();
-        let dir = dir.path().join("block");
-        let dir = dir.to_str().unwrap();
-
-        let alias = block_mount_alias(dir, "/dev/vdb", "254:16").unwrap();
-        assert_eq!(alias, format!("{}/254-16", dir));
-        assert!(!alias.contains("vdb"));
-        assert_eq!(fs::read_link(&alias).unwrap(), Path::new("/dev/vdb"));
-
-        // The same device under another name after a hotplug: the link follows.
-        let again = block_mount_alias(dir, "/dev/vdc", "254:16").unwrap();
-        assert_eq!(again, alias);
-        assert_eq!(fs::read_link(&alias).unwrap(), Path::new("/dev/vdc"));
-
-        // What is no device node is mounted as it is.
-        assert_eq!(block_mount_alias(dir, "tmpfs", "0:0").unwrap(), "tmpfs");
-    }
 
     fn storage_with_driver_options(options: &[&str]) -> Storage {
         Storage {

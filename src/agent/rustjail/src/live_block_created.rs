@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Register only nodes from this init child's creation spec before exec release.
 //! This is not adoption of an existing running container or agent recovery.
-use super::{AttachedNode, BlockDeviceNodes, open_node};
+use super::{by_id_link, create_link, kernel_name, AttachedNode, BlockDeviceNodes, open_node};
 use anyhow::{bail, Context, Result};
 use oci_spec::runtime::{LinuxDeviceType, Spec};
 use serde::Deserialize;
-use std::{collections::HashSet, convert::TryFrom, fs::File, os::unix::fs::MetadataExt};
+use std::{collections::HashSet, convert::TryFrom, ffi::CString, fs::File, io,
+          os::{fd::AsRawFd, unix::fs::MetadataExt}};
 
 pub const CREATED_KEY: &str = "io.katacontainers.block-attachments.v1";
 
@@ -46,11 +47,8 @@ impl BlockDeviceNodes {
         let mut names = HashSet::new();
         let mut requests = HashSet::new();
         for entry in entries {
-            let name = entry.destination.strip_prefix("/dev/").unwrap_or("");
-            let suffix = name.strip_prefix("sd").or_else(|| name.strip_prefix("vd")).unwrap_or("");
-            if !canonical_request(&entry.request_id) || !(1..=2).contains(&suffix.len())
-                || !suffix.bytes().all(|byte| byte.is_ascii_lowercase())
-                || matches!(name, "sda" | "vda")
+            let link = by_id_link(&entry.destination).unwrap_or("");
+            if !canonical_request(&entry.request_id) || link.is_empty()
                 || !names.insert(entry.destination.clone()) || !requests.insert(entry.request_id.clone()) {
                 bail!("invalid or duplicate created attachment identity");
             }
@@ -61,6 +59,12 @@ impl BlockDeviceNodes {
             }
             let major = u32::try_from(matching[0].major()).context("invalid created major")?;
             let minor = u32::try_from(matching[0].minor()).context("invalid created minor")?;
+            // Nova Kata (ADR-058): the node made at the destination, the
+            // by-id link, moves to the kernel's name of the disk, and the
+            // link takes its place. The init child runs no tenant code yet.
+            let name = kernel_name(major, minor)?;
+            let name = name.as_str();
+            move_to_kernel_name(directory, link, name)?;
             let node = open_node(directory, name)?;
             let actual = node.metadata()?;
             if actual.mode() & libc::S_IFMT != libc::S_IFBLK || actual.rdev() != libc::makedev(major, minor) {
@@ -68,9 +72,26 @@ impl BlockDeviceNodes {
             }
             result.attached.insert(entry.request_id.clone(), AttachedNode {
                 request: format!("created:{}:{}:{}:{}", entry.request_id, entry.destination, major, minor),
-                name: name.into(), node, detach: None, created: true,
+                name: name.into(), link: link.into(), node, detach: None, created: true,
             });
         }
         Ok(result)
     }
+}
+
+/// Renames the node at /dev/disk/by-id/`link` to /dev/`name` and links the
+/// former to the latter. A node already at `name` is a conflict.
+fn move_to_kernel_name(directory: &File, link: &str, name: &str) -> Result<()> {
+    if name.is_empty() || name.contains('/') { bail!("invalid kernel name"); }
+    let from = CString::new(format!("disk/by-id/{link}"))?;
+    let to = CString::new(name)?;
+    // renameat2 with RENAME_NOREPLACE: an existing /dev/<name> is refused.
+    let result = unsafe {
+        libc::syscall(libc::SYS_renameat2, directory.as_raw_fd(), from.as_ptr(),
+                      directory.as_raw_fd(), to.as_ptr(), libc::RENAME_NOREPLACE)
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error()).context("move created block node to its kernel name");
+    }
+    create_link(directory, link, name)
 }

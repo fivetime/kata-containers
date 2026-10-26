@@ -330,6 +330,9 @@ impl AgentService {
         )
         .await?;
 
+        // Nova Kata (ADR-058): the config drive's ISO through loop devices.
+        crate::nova_config_drive::prepare(&cid, &mut oci)?;
+
         // Handle sealed secrets after storage is mounted
         cdh_handler_sealed_secrets(&mut oci)
             .await
@@ -969,10 +972,10 @@ impl agent_ttrpc::AgentService for AgentService {
         }
         let device = req.device.as_ref().ok_or_else(||
             ttrpc_error(ttrpc::Code::INVALID_ARGUMENT, "block device required"))?;
-        let name = device.container_path.strip_prefix("/dev/")
-            .filter(|name| !name.is_empty() && *name != "." && *name != ".."
-                && !name.contains('/') && !name.contains('\0'))
-            .ok_or_else(|| ttrpc_error(ttrpc::Code::INVALID_ARGUMENT, "invalid device path"))?;
+        // Nova Kata (ADR-058): the destination is the volume's by-id link;
+        // the node takes the guest kernel's name of the disk.
+        let link = rustjail::live_block_device::by_id_link(&device.container_path)
+            .map_err(|_| ttrpc_error(ttrpc::Code::INVALID_ARGUMENT, "invalid device path"))?;
         let original_directory = {
             let mut sandbox = self.sandbox.lock().await;
             sandbox.get_container(&req.container_id)
@@ -989,7 +992,7 @@ impl agent_ttrpc::AgentService for AgentService {
         let container = sandbox.get_container(&req.container_id)
             .map_ttrpc_err(ttrpc::Code::NOT_FOUND, "container not found")?;
         container.attach_live_block_device(&original_directory, &req.request_id,
-            &signature, name, major, minor).map_ttrpc_err(same)?;
+            &signature, link, major, minor).map_ttrpc_err(same)?;
         Ok(Empty::new())
     }
 

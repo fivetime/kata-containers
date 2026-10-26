@@ -26,9 +26,111 @@ impl std::error::Error for DetachAdmission {}
 struct AttachedNode {
     created: bool,
     request: String,
+    /// The guest kernel's name of the disk, the node's name in /dev.
     name: String,
+    /// Nova Kata (ADR-058): the disk's link in /dev/disk/by-id.
+    link: String,
     node: File,
     detach: Option<PendingDetach>,
+}
+
+/// Nova Kata (ADR-058): the workload's /dev has each disk at the guest
+/// kernel's name, as a libvirt guest's has, and the stable reference of a
+/// volume, /dev/disk/by-id/virtio-<first 20 characters of its ID>, links to
+/// it. The workload has no udev to make the link. The destination a disk is
+/// given by is that link; its name is the kernel's, found once it is
+/// resolved.
+const BY_ID_PREFIX: &str = "/dev/disk/by-id/";
+
+/// The link's name of a destination, `virtio-` and 20 characters of an ID.
+pub fn by_id_link(destination: &str) -> Result<&str> {
+    let link = destination.strip_prefix(BY_ID_PREFIX).unwrap_or("");
+    let id = link.strip_prefix("virtio-").unwrap_or("");
+    if id.len() != 20
+        || !id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b) || b == b'-') {
+        bail!("invalid block device destination");
+    }
+    Ok(link)
+}
+
+/// The guest kernel's name of a block device, from its sysfs uevent.
+pub fn kernel_name(major: u32, minor: u32) -> Result<String> {
+    kernel_name_in(&std::fs::read_to_string(format!("/sys/dev/block/{major}:{minor}/uevent"))
+        .context("read block device uevent")?)
+}
+
+fn kernel_name_in(uevent: &str) -> Result<String> {
+    let names: Vec<_> = uevent.lines().filter_map(|line| line.strip_prefix("DEVNAME=")).collect();
+    match names.as_slice() {
+        [name] if !name.is_empty() && name.len() <= 32
+            && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) => Ok(name.to_string()),
+        _ => bail!("block device has no plain kernel name"),
+    }
+}
+
+fn open_directory(parent: &File, name: &str, create: bool) -> Result<File> {
+    let cname = CString::new(name)?;
+    if create && unsafe { libc::mkdirat(parent.as_raw_fd(), cname.as_ptr(), 0o755) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(error).context("create workload device directory");
+        }
+    }
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), cname.as_ptr(),
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    if fd < 0 { return Err(io::Error::last_os_error()).context("open workload device directory"); }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn by_id_directory(directory: &File, create: bool) -> Result<File> {
+    let disk = open_directory(directory, "disk", create)?;
+    open_directory(&disk, "by-id", create)
+}
+
+fn link_in(by: &File, link: &str, name: &str) -> Result<()> {
+    let target = CString::new(format!("../../{name}"))?;
+    let link = CString::new(link)?;
+    if unsafe { libc::symlinkat(target.as_ptr(), by.as_raw_fd(), link.as_ptr()) } != 0 {
+        return Err(io::Error::last_os_error()).context("link workload block node");
+    }
+    Ok(())
+}
+
+/// Links `link` in /dev/disk/by-id to the node `name`; an existing entry is
+/// a conflict.
+pub fn create_link(directory: &File, link: &str, name: &str) -> Result<()> {
+    link_in(&by_id_directory(directory, true)?, link, name)
+}
+
+/// Nova Kata (ADR-058): the config drive's /dev/disk/by-label link to its
+/// loop device, whose name the agent recorded in the spec under `key`.
+pub fn create_label_link(directory: &File, spec: &oci_spec::runtime::Spec, key: &str,
+                         label: &str) -> Result<()> {
+    let Some(name) = spec.annotations().as_ref().and_then(|a| a.get(key)) else { return Ok(()); };
+    let number = name.strip_prefix("loop").unwrap_or("");
+    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+        bail!("invalid config drive device");
+    }
+    let disk = open_directory(directory, "disk", true)?;
+    link_in(&open_directory(&disk, "by-label", true)?, label, name)
+}
+
+/// Removes the link; one that is gone already is removed.
+fn remove_link(directory: &File, link: &str) -> Result<()> {
+    let by_id = match by_id_directory(directory, false) {
+        Ok(by_id) => by_id,
+        Err(error) if error.downcast_ref::<io::Error>()
+            .is_some_and(|e| e.kind() == io::ErrorKind::NotFound) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let link = CString::new(link)?;
+    if unsafe { libc::unlinkat(by_id.as_raw_fd(), link.as_ptr(), 0) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::NotFound {
+            return Err(error).context("remove workload block link");
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -59,9 +161,9 @@ impl BlockDeviceNodes {
 
     // A paused workload may verify an existing registration, never create one.
     pub fn verify_existing(&mut self, directory: &File, request_id: &str,
-        request: &str, name: &str, major: u32, minor: u32) -> Result<()> {
+        request: &str, link: &str, major: u32, minor: u32) -> Result<()> {
         if !self.contains_active(request_id) { bail!("unknown or detaching block registration"); }
-        self.attach(directory, request_id, request, name, major, minor)
+        self.attach(directory, request_id, request, link, major, minor)
     }
 
     pub fn detach_completed(&self, attach_id: &str, request_id: &str) -> Result<bool> {
@@ -84,7 +186,9 @@ impl BlockDeviceNodes {
             if pending.withdrawn {
                 match open_node(directory, &node.name) {
                     Err(error) if error.downcast_ref::<io::Error>()
-                        .is_some_and(|e| e.kind() == io::ErrorKind::NotFound) => return Ok(()),
+                        .is_some_and(|e| e.kind() == io::ErrorKind::NotFound) => {
+                        return remove_link(directory, &node.link);
+                    }
                     _ => bail!("withdrawn block device pathname is occupied or unreadable"),
                 }
             }
@@ -105,7 +209,7 @@ impl BlockDeviceNodes {
             return Err(io::Error::last_os_error()).context("withdraw workload block node");
         }
         node.detach.as_mut().unwrap().withdrawn = true;
-        Ok(())
+        remove_link(directory, &node.link)
     }
 
     /// Only the native runtime's confirmed VMM removal authorizes this phase.
@@ -130,14 +234,18 @@ impl BlockDeviceNodes {
 
     /// In-memory replay is scoped to this original LinuxContainer. Unknown
     /// existing nodes are never adopted after a lost agent/container state.
+    /// The node takes the kernel's name of the disk; `link` is its link in
+    /// /dev/disk/by-id.
     pub fn attach(&mut self, directory: &File, request_id: &str, request: &str,
-                  name: &str, major: u32, minor: u32) -> Result<()> {
+                  link: &str, major: u32, minor: u32) -> Result<()> {
         if request_id.is_empty() || request_id.len() > 128 {
             bail!("invalid block-device request ID");
         }
+        let name = kernel_name(major, minor)?;
+        let name = name.as_str();
         if let Some(prior) = self.attached.get_mut(request_id) {
             if prior.detach.is_some() { bail!("attachment is detaching or detached"); }
-            if (!prior.created && prior.request != request) || prior.name != name {
+            if (!prior.created && prior.request != request) || prior.name != name || prior.link != link {
                 bail!("block-device request conflicts with prior attachment");
             }
             let original = prior.node.metadata()?;
@@ -156,6 +264,9 @@ impl BlockDeviceNodes {
             }
             return Ok(());
         }
+        if self.attached.values().any(|node| node.link == link && node.detach.is_none()) {
+            bail!("block-device link is another attachment's");
+        }
         create_block_node(directory, name, major, minor)?;
         let node = open_node(directory, name)?;
         let metadata = node.metadata()?;
@@ -163,10 +274,46 @@ impl BlockDeviceNodes {
             || metadata.rdev() != libc::makedev(major, minor) {
             bail!("new device node changed before registration");
         }
+        if let Err(error) = create_link(directory, link, name) {
+            // The node is this request's own, made just now: take it back.
+            let cname = CString::new(name)?;
+            unsafe { libc::unlinkat(directory.as_raw_fd(), cname.as_ptr(), 0) };
+            return Err(error);
+        }
         self.attached.insert(request_id.to_owned(), AttachedNode {
-            request: request.to_owned(), name: name.to_owned(), node, detach: None, created: false,
+            request: request.to_owned(), name: name.to_owned(), link: link.to_owned(),
+            node, detach: None, created: false,
         });
         Ok(())
+    }
+}
+
+/// Nova Kata (ADR-058): the workload's root disk in its /dev at the guest
+/// kernel's name, as a libvirt guest has its root, so that /proc/mounts,
+/// /sys/block and /dev name it alike. A root that is no block device (a
+/// shared file system) has none. Called during the creation handshake,
+/// before the init child runs tenant code.
+pub fn create_root_node(directory: &File, init_pid: i32) -> Result<()> {
+    let root = std::fs::metadata(format!("/proc/{init_pid}/root"))
+        .context("stat init child root")?;
+    let (major, minor) = (libc::major(root.dev()), libc::minor(root.dev()));
+    if !std::path::Path::new(&format!("/sys/dev/block/{major}:{minor}")).exists() {
+        return Ok(());
+    }
+    let name = kernel_name(major, minor)?;
+    match create_block_node(directory, &name, major, minor) {
+        Ok(()) => Ok(()),
+        Err(error) if error.downcast_ref::<io::Error>()
+            .is_some_and(|e| e.kind() == io::ErrorKind::AlreadyExists) => {
+            let existing = open_node(directory, &name)?.metadata()?;
+            if existing.mode() & libc::S_IFMT == libc::S_IFBLK
+                && existing.rdev() == libc::makedev(major, minor) {
+                Ok(())
+            } else {
+                bail!("the root disk's name is another node's")
+            }
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -216,4 +363,41 @@ pub fn create_block_node(dev_directory: &File, name: &str, major: u32, minor: u3
         return Err(io::Error::last_os_error()).context("create workload block node");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_destination_is_a_volumes_by_id_link() {
+        assert_eq!(by_id_link("/dev/disk/by-id/virtio-0123abcd-0123-4567-8").unwrap(),
+                   "virtio-0123abcd-0123-4567-8");
+        for bad in ["/dev/vdb", "/dev/disk/by-id/virtio-0123", "/dev/disk/by-id/scsi-0123abcd-0123-4567-8",
+                    "/dev/disk/by-id/virtio-0123ABCD-0123-4567-8",
+                    "/dev/disk/by-id/virtio-0123abcd/0123-4567-8"] {
+            assert!(by_id_link(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_node_takes_the_kernels_name() {
+        assert_eq!(kernel_name_in("MAJOR=254\nMINOR=16\nDEVNAME=vdb\nDEVTYPE=disk\n").unwrap(), "vdb");
+        for bad in ["MAJOR=254\n", "DEVNAME=../vdb\n", "DEVNAME=vdb\nDEVNAME=vdc\n", "DEVNAME=\n"] {
+            assert!(kernel_name_in(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_link_is_made_and_removed_under_dev() {
+        let dev = tempfile::tempdir().unwrap();
+        let directory = File::open(dev.path()).unwrap();
+        create_link(&directory, "virtio-0123abcd-0123-4567-8", "vdb").unwrap();
+        let link = dev.path().join("disk/by-id/virtio-0123abcd-0123-4567-8");
+        assert_eq!(std::fs::read_link(&link).unwrap(), std::path::Path::new("../../vdb"));
+        assert!(create_link(&directory, "virtio-0123abcd-0123-4567-8", "vdc").is_err());
+        remove_link(&directory, "virtio-0123abcd-0123-4567-8").unwrap();
+        remove_link(&directory, "virtio-0123abcd-0123-4567-8").unwrap();
+        assert!(link.symlink_metadata().is_err());
+    }
 }

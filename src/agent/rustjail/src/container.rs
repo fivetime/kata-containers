@@ -1256,6 +1256,9 @@ impl BaseContainer for LinuxContainer {
                     .and_then(|_| {
                         let directory = crate::live_block_device::pin_workload_dev(p.pid)?;
                         *live_block_nodes = crate::live_block_device::BlockDeviceNodes::capture_created(&directory, spec)?;
+                        crate::live_block_device::create_root_node(&directory, p.pid)?;
+                        crate::live_block_device::create_label_link(&directory, spec,
+                            "io.openstack.nova.kata.config-drive-node.v1", "config-2")?;
                         *workload_dev = Some(directory);
                         Ok(())
                     })
@@ -2358,7 +2361,7 @@ impl LinuxContainer {
     }
 
     pub fn attach_live_block_device(&mut self, original: &fs::File,
-        request_id: &str, request: &str, name: &str, major: u32, minor: u32) -> Result<()> {
+        request_id: &str, request: &str, link: &str, major: u32, minor: u32) -> Result<()> {
         use std::os::unix::fs::MetadataExt;
         let current = self.live_device_directory(request_id)?;
         let left = original.metadata()?;
@@ -2367,9 +2370,9 @@ impl LinuxContainer {
             return Err(anyhow!("container changed during device discovery"));
         }
         if self.status() == ContainerState::Paused {
-            self.live_block_nodes.verify_existing(&current, request_id, request, name, major, minor)
+            self.live_block_nodes.verify_existing(&current, request_id, request, link, major, minor)
         } else {
-            self.live_block_nodes.attach(&current, request_id, request, name, major, minor)
+            self.live_block_nodes.attach(&current, request_id, request, link, major, minor)
         }
     }
 }

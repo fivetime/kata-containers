@@ -83,6 +83,12 @@ pub fn validate_detach_target(request: &BlockAttach, original: &BlockAttach) -> 
     Ok(())
 }
 
+/// The by-id link of a volume, as a libvirt guest has it: `virtio-` and the
+/// first 20 characters of its ID.
+pub fn by_id_destination(volume_uuid: &str) -> String {
+    format!("/dev/disk/by-id/virtio-{}", &volume_uuid[..volume_uuid.len().min(20)])
+}
+
 fn canonical_uuid(value: &str) -> bool {
     uuid::Uuid::parse_str(value).map(|id| id.to_string() == value).unwrap_or(false)
 }
@@ -120,10 +126,9 @@ pub fn parse(req: &UpdateRequest) -> Result<Option<BlockAttach>> {
         || parts[5] != "volumes" || parts[6] != value.volume_uuid {
         bail!("volume_update_invalid: direct-volume source identity");
     }
-    let name = value.destination.strip_prefix("/dev/").unwrap_or("");
-    let suffix = name.strip_prefix("sd").or_else(|| name.strip_prefix("vd")).unwrap_or("");
-    if !(1..=2).contains(&suffix.len()) || !suffix.bytes().all(|b| b.is_ascii_lowercase())
-        || matches!(name, "sda" | "vda") {
+    // Nova Kata (ADR-058): a volume is given by its by-id link, which the
+    // agent makes to the guest kernel's name of the disk.
+    if value.destination != by_id_destination(&value.volume_uuid) {
         bail!("volume_update_invalid: destination");
     }
     Ok(Some(value))
