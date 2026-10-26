@@ -81,7 +81,7 @@ impl BlockDeviceNodes {
 
 /// Renames the node at /dev/disk/by-id/`link` to /dev/`name` and links the
 /// former to the latter. A node already at `name` is a conflict.
-fn move_to_kernel_name(directory: &File, link: &str, name: &str) -> Result<()> {
+pub(super) fn move_to_kernel_name(directory: &File, link: &str, name: &str) -> Result<()> {
     if name.is_empty() || name.contains('/') { bail!("invalid kernel name"); }
     let from = CString::new(format!("disk/by-id/{link}"))?;
     let to = CString::new(name)?;

@@ -332,6 +332,7 @@ impl AgentService {
 
         // Nova Kata (ADR-058): the config drive's ISO through loop devices.
         crate::nova_config_drive::prepare(&cid, &mut oci)?;
+        crate::nova_disks::by_id_binds_to_devices(&mut oci)?;
 
         // Handle sealed secrets after storage is mounted
         cdh_handler_sealed_secrets(&mut oci)

@@ -317,6 +317,36 @@ pub fn create_root_node(directory: &File, init_pid: i32) -> Result<()> {
     }
 }
 
+/// Nova Kata (ADR-058): every other block device of the spec at a by-id
+/// link (a volume bound into a container without the initial-volume plan,
+/// which the agent made a device) moves to the kernel's name, and the link
+/// takes its place. Called during the creation handshake after
+/// capture_created, whose nodes are links already.
+pub fn place_by_id_nodes(directory: &File, spec: &oci_spec::runtime::Spec) -> Result<()> {
+    let Some(devices) = spec.linux().as_ref().and_then(|l| l.devices().as_ref()) else {
+        return Ok(());
+    };
+    for device in devices {
+        let Some(path) = device.path().to_str() else { continue; };
+        if device.typ() != oci_spec::runtime::LinuxDeviceType::B || !path.starts_with(BY_ID_PREFIX) {
+            continue;
+        }
+        let link = by_id_link(path)?;
+        let node = open_node(directory, &format!("disk/by-id/{link}"))?;
+        let metadata = node.metadata()?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        let (major, minor) = (libc::major(metadata.rdev()), libc::minor(metadata.rdev()));
+        if metadata.mode() & libc::S_IFMT != libc::S_IFBLK
+            || i64::from(major) != device.major() || i64::from(minor) != device.minor() {
+            bail!("the node at a by-id link is not its device");
+        }
+        created::move_to_kernel_name(directory, link, &kernel_name(major, minor)?)?;
+    }
+    Ok(())
+}
+
 /// Called only during the native init-child creation handshake, before the
 /// child is released from its exec FIFO. Never use this to recover by old PID.
 pub fn pin_workload_dev(init_pid: i32) -> Result<File> {

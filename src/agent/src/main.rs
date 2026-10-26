@@ -52,6 +52,7 @@ mod namespace;
 mod netlink;
 mod network;
 mod nova_config_drive;
+mod nova_disks;
 mod nova_resize;
 mod passfd_io;
 mod pci;

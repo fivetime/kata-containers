@@ -42,6 +42,10 @@ pub struct Exec {
     pub(crate) oci_process: OCIProcess,
 }
 
+/// Nova Kata (ADR-058): the order in which a container's disks are plugged.
+const DISK_ORDER_KEY: &str = "io.openstack.nova.kata.disk-order.v1";
+const DISK_ORDER_VOLUMES_FIRST: &str = "volumes-first";
+
 pub struct Container {
     pid: u32,
     pub container_id: ContainerID,
@@ -144,12 +148,6 @@ impl Container {
         )
         .context("amend spec")?;
 
-        // get mutable root from oci spec
-        let root = match spec.root_mut() {
-            Some(root) => root,
-            None => return Err(anyhow!("spec miss root field")),
-        };
-
         // Nova Kata (ADR-052): the container of a guest that arrives by a
         // live migration runs in it already: its devices are placed on the
         // host as on the source, and nothing is said to its agent. A VMM
@@ -159,6 +157,41 @@ impl Container {
         let receives_devices = migrated_in
             && toml_config.runtime.hypervisor_name
                 == kata_types::config::hypervisor::HYPERVISOR_NAME_CH;
+
+        // Nova Kata (ADR-058): the guest kernel names disks in the order they
+        // are plugged. A stable device rescue has the instance's disks first
+        // and the rescue system's root last, as Nova's libvirt driver
+        // attaches them; any other container has its root first.
+        let volumes_first = self
+            .spec
+            .annotations()
+            .as_ref()
+            .and_then(|a| a.get(DISK_ORDER_KEY))
+            .map(|order| match order.as_str() {
+                DISK_ORDER_VOLUMES_FIRST => Ok(true),
+                _ => Err(anyhow!("unknown disk order {order}")),
+            })
+            .transpose()?
+            .unwrap_or(false);
+        let early_volumes = if volumes_first && !receives_devices {
+            if super::live_volume_created::has_initial(&self.spec) {
+                return Err(anyhow!("a container with initial volumes has its root first"));
+            }
+            Some(
+                self.resource_manager
+                    .handler_volumes(&config.container_id, &spec)
+                    .await
+                    .context("handler volumes")?,
+            )
+        } else {
+            None
+        };
+
+        // get mutable root from oci spec
+        let root = match spec.root_mut() {
+            Some(root) => root,
+            None => return Err(anyhow!("spec miss root field")),
+        };
 
         let mut storages = vec![];
         if !receives_devices {
@@ -206,6 +239,8 @@ impl Container {
         // handler volumes
         let volumes = if receives_devices {
             vec![]
+        } else if let Some(volumes) = early_volumes {
+            volumes
         } else {
             self.resource_manager
                 .handler_volumes(&config.container_id, &spec)

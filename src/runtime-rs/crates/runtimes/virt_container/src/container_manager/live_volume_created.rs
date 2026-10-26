@@ -154,3 +154,10 @@ impl CreatedVolumes {
         Ok(())
     }
 }
+
+/// Whether the spec carries an initial-volume plan.
+pub fn has_initial(spec: &oci::Spec) -> bool {
+    spec.annotations()
+        .as_ref()
+        .is_some_and(|a| a.keys().any(|key| key.starts_with("io.katacontainers.volume-initial.")))
+}

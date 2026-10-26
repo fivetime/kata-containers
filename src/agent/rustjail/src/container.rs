@@ -1256,6 +1256,7 @@ impl BaseContainer for LinuxContainer {
                     .and_then(|_| {
                         let directory = crate::live_block_device::pin_workload_dev(p.pid)?;
                         *live_block_nodes = crate::live_block_device::BlockDeviceNodes::capture_created(&directory, spec)?;
+                        crate::live_block_device::place_by_id_nodes(&directory, spec)?;
                         crate::live_block_device::create_root_node(&directory, p.pid)?;
                         crate::live_block_device::create_label_link(&directory, spec,
                             "io.openstack.nova.kata.config-drive-node.v1", "config-2")?;
