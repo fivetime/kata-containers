@@ -15,7 +15,7 @@ use crate::utils::set_process_credentials;
 use crate::utils::vm_cleanup;
 use crate::utils::{bytes_to_megs, get_jailer_root, get_sandbox_path, megs_to_bytes};
 use crate::MemoryConfig;
-use crate::VM_ROOTFS_DRIVER_BLK;
+use crate::{VM_ROOTFS_DRIVER_BLK, VM_ROOTFS_DRIVER_PMEM};
 use crate::{VcpuThreadIds, VmmState};
 use anyhow::{anyhow, Context, Result};
 use ch_config::ch_api::cloud_hypervisor_vm_netdev_add;
@@ -130,8 +130,13 @@ impl CloudHypervisorInner {
         let confidential_guest = cfg.security_info.confidential_guest;
 
         // Note that the configuration option hypervisor.block_device_driver is not used.
-        // NVDIMM is not supported for Cloud Hypervisor.
-        let rootfs_driver = VM_ROOTFS_DRIVER_BLK;
+        // The image is on virtio-pmem when so configured, else on virtio-blk
+        // (Nova Kata, ADR-058).
+        let rootfs_driver = if cfg.boot_info.vm_rootfs_driver == VM_ROOTFS_DRIVER_PMEM {
+            VM_ROOTFS_DRIVER_PMEM
+        } else {
+            VM_ROOTFS_DRIVER_BLK
+        };
 
         let rootfs_type = match cfg.boot_info.rootfs_type.is_empty() {
             true => DEFAULT_CH_ROOTFS_TYPE,

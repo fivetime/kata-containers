@@ -15,7 +15,7 @@ use kata_sys_util::protection::GuestProtection;
 use kata_types::config::default::DEFAULT_CH_ENTROPY_SOURCE;
 use kata_types::config::hypervisor::Hypervisor as HypervisorConfig;
 use kata_types::config::hypervisor::{
-    CpuInfo, MachineInfo, MemoryInfo, VIRTIO_BLK_MMIO, VIRTIO_BLK_PCI,
+    CpuInfo, MachineInfo, MemoryInfo, VIRTIO_BLK_MMIO, VIRTIO_BLK_PCI, VIRTIO_PMEM,
 };
 use kata_types::config::BootInfo;
 use std::convert::TryFrom;
@@ -130,7 +130,8 @@ impl TryFrom<NamedHypervisorConfig> for VmConfig {
         //
         // - An initrd/initramfs is specified in PayloadConfig.
         // - An image is specified in DiskConfig.
-        //   Note: pmem is not used as it's not properly supported by Cloud Hypervisor.
+        //   On virtio-pmem when vm_rootfs_driver says so, so that it takes no
+        //   virtio-blk name in the guest (Nova Kata, ADR-058).
         //   - If TDX is enabled, the firmware (`td-shim` [1]) must be
         //     specified in PayloadConfig.
         //
@@ -159,8 +160,13 @@ impl TryFrom<NamedHypervisorConfig> for VmConfig {
         );
 
         let mut disks: Vec<DiskConfig> = vec![];
+        let mut pmem = None;
 
-        if use_image {
+        if use_image && boot_info.vm_rootfs_driver == VIRTIO_PMEM {
+            pmem = Some(vec![
+                PmemConfig::try_from(&boot_info).map_err(VmConfigError::PmemError)?
+            ]);
+        } else if use_image {
             let disk = DiskConfig::try_from(boot_info).map_err(VmConfigError::DiskError)?;
 
             disks.push(disk);
@@ -210,6 +216,7 @@ impl TryFrom<NamedHypervisorConfig> for VmConfig {
             net,
             devices: host_devices,
             disks,
+            pmem,
             vsock: Some(vsock),
             rng,
             platform,
