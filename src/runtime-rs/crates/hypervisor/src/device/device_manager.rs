@@ -377,6 +377,8 @@ impl DeviceManager {
                     path: config.path_on_host,
                     index: config.index,
                     copy: false,
+                    bus: None,
+                    slot: None,
                 });
             }
         }

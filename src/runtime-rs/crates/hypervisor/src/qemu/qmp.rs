@@ -100,6 +100,9 @@ pub struct Qmp {
     /// Nova Kata (ADR-052): by frontend id, whether the NIC is modern virtio.
     network_modern: HashMap<String, bool>,
     network_pins: HashMap<String, (String, i64, bool)>,
+    /// Nova Kata (ADR-058): on a migration's destination, the place each
+    /// virtio-blk device had on the source, by its index.
+    block_pins: HashMap<u64, (String, i64)>,
 }
 
 // We have to implement Debug since the Hypervisor trait requires it and Qmp
@@ -132,6 +135,7 @@ impl Qmp {
                 network_macs: HashMap::new(),
                 network_modern: HashMap::new(),
                 network_pins: HashMap::new(),
+                block_pins: HashMap::new(),
             };
 
             let info = qmp.qmp.handshake().context("qmp handshake failed")?;
@@ -230,6 +234,29 @@ impl Qmp {
     /// network device had on the source, by its guest MAC.
     pub fn set_network_pins(&mut self, pins: HashMap<String, (String, i64, bool)>) {
         self.network_pins = pins;
+    }
+
+    /// Nova Kata (ADR-058): on a migration's destination, the place each
+    /// virtio-blk device had on the source, by its index.
+    pub fn set_block_pins(&mut self, pins: HashMap<u64, (String, i64)>) {
+        self.block_pins = pins;
+    }
+
+    /// Nova Kata (ADR-058): the place of each block device on a bridge, by
+    /// its index (the device id is its node, `drive-<index>`).
+    pub fn migration_block_places(&self) -> HashMap<u64, (String, i64)> {
+        let mut places = HashMap::new();
+        for (bus, slots) in &self.pci_bridge_devices {
+            for (slot, device) in slots {
+                if let Some(index) = device
+                    .strip_prefix("drive-")
+                    .and_then(|index| index.parse::<u64>().ok())
+                {
+                    places.insert(index, (bus.clone(), *slot));
+                }
+            }
+        }
+        places
     }
 
     /// Nova Kata (ADR-052): the network devices on the bridges, by MAC.
@@ -1632,6 +1659,7 @@ impl Qmp {
         vmdk: Option<&VmdkConfig>,
         iothread: Option<&str>,
         io_limits: Option<&BlockIoLimits>,
+        serial: Option<&str>,
     ) -> Result<(Option<PciPath>, Option<String>)> {
         // `blockdev-add`
         let node_name = block_node_name(index);
@@ -1772,6 +1800,11 @@ impl Qmp {
         if physical_block_size > 0 {
             blkdev_add_args.insert("physical_block_size".to_owned(), physical_block_size.into());
         }
+        // Nova Kata (ADR-058): the disk's serial, which the guest's
+        // /dev/disk/by-id names it by, as a cold-plugged disk has it.
+        if let Some(serial) = serial.filter(|serial| !serial.is_empty()) {
+            blkdev_add_args.insert("serial".to_owned(), serial.to_owned().into());
+        }
 
         if block_driver == VIRTIO_SCSI {
             // Helper closure to decode a flattened u16 SCSI index into an (ID, LUN) pair.
@@ -1881,7 +1914,26 @@ impl Qmp {
 
             Ok((None, Some(ccw_addr)))
         } else {
-            let (bus, slot) = match self.find_free_slot() {
+            // Nova Kata (ADR-058): on a migration's destination the device
+            // takes the place it had on the source; the VM's state names it.
+            let pinned = match self.block_pins.get(&index) {
+                Some((bus, slot)) => {
+                    let taken = self
+                        .pci_bridge_devices
+                        .get(bus)
+                        .map(|slots| slots.contains_key(slot))
+                        .unwrap_or(true);
+                    if taken {
+                        Err(anyhow!(
+                            "migration_invalid: the place {bus}/{slot} of a block device is taken"
+                        ))
+                    } else {
+                        Ok((bus.clone(), *slot))
+                    }
+                }
+                None => self.find_free_slot(),
+            };
+            let (bus, slot) = match pinned {
                 Ok(value) => value,
                 Err(err) => {
                     if self

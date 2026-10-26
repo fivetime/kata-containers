@@ -1159,7 +1159,14 @@ impl Sandbox for VirtSandbox {
         match update.action.as_str() {
             "manifest" => {
                 let device_manager = self.resource_manager.get_device_manager().await;
-                let blocks = device_manager.read().await.migration_blocks().await;
+                let mut blocks = device_manager.read().await.migration_blocks().await;
+                let places = self.hypervisor.migration_block_places().await?;
+                for pin in &mut blocks {
+                    if let Some((bus, slot)) = places.get(&pin.index) {
+                        pin.bus = Some(bus.clone());
+                        pin.slot = Some(*slot);
+                    }
+                }
                 let networks = self.hypervisor.migration_networks().await?;
                 let manifest = hypervisor::migration::DeviceManifest {
                     version: 1,

@@ -645,6 +645,14 @@ impl QemuInner {
             .migration_incoming_stream(stream)
     }
 
+    pub(crate) fn migration_block_places(&self) -> Result<HashMap<u64, (String, i64)>> {
+        Ok(self
+            .qmp
+            .as_ref()
+            .context("migration_unsupported: QMP is not connected")?
+            .migration_block_places())
+    }
+
     pub(crate) fn migration_networks(&self) -> Result<Vec<crate::migration::NetworkPin>> {
         Ok(self
             .qmp
@@ -1127,8 +1135,15 @@ impl QemuInner {
                     }
                 }
                 // Nova Kata (ADR-052): a network device hot-plugged before
-                // the transfer takes the place it had on the source.
+                // the transfer takes the place it had on the source, and
+                // so does a disk (ADR-058).
                 qmp.set_network_pins(pins);
+                qmp.set_block_pins(
+                    self.incoming
+                        .as_ref()
+                        .map(|incoming| incoming.block_places())
+                        .unwrap_or_default(),
+                );
                 self.qmp = Some(qmp);
             }
             Err(e) => {
@@ -1880,6 +1895,7 @@ impl QemuInner {
                     logical_sector_size,
                     physical_sector_size,
                     io_limits,
+                    serial_override,
                 ) = {
                     let cfg = &block_device.lock().await.config;
                     (
@@ -1898,6 +1914,7 @@ impl QemuInner {
                         cfg.logical_sector_size,
                         cfg.physical_sector_size,
                         cfg.io_limits,
+                        cfg.serial_override.clone(),
                     )
                 };
 
@@ -1933,6 +1950,7 @@ impl QemuInner {
                         vmdk.as_ref(),
                         iothread,
                         io_limits.as_ref(),
+                        Some(serial_override.as_str()),
                     )
                     .context("hotplug block device")?;
 

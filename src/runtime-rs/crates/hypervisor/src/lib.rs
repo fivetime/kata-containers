@@ -200,6 +200,11 @@ pub trait Hypervisor: std::fmt::Debug + Send + Sync {
     async fn migration_networks(&self) -> Result<Vec<migration::NetworkPin>> {
         Err(anyhow::anyhow!("migration_unsupported: this hypervisor does not live-migrate"))
     }
+    /// The PCI place of each block device on a bridge, by its index
+    /// (ADR-058); a VMM that carries its own device configuration has none.
+    async fn migration_block_places(&self) -> Result<HashMap<u64, (String, i64)>> {
+        Ok(HashMap::new())
+    }
     fn supports_block_growth(&self) -> bool { false }
     async fn grow_block_device(&self, _device: DeviceType, _requested: u64) -> Result<()> {
         Err(anyhow::anyhow!("block growth unsupported by this hypervisor"))

@@ -239,6 +239,9 @@ impl Hypervisor for Qemu {
     async fn migration_networks(&self) -> Result<Vec<crate::migration::NetworkPin>> {
         self.inner.read().await.migration_networks()
     }
+    async fn migration_block_places(&self) -> Result<HashMap<u64, (String, i64)>> {
+        self.inner.read().await.migration_block_places()
+    }
     fn supports_block_growth(&self) -> bool { true }
     async fn grow_block_device(&self, device: DeviceType, requested: u64) -> Result<()> {
         let mut inner = self.inner.write().await;

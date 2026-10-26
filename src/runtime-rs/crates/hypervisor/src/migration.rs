@@ -21,11 +21,14 @@ const MAX_MIGRATE_IN_BYTES: usize = 64 * 1024;
 const MAX_DEVICES: usize = 256;
 
 /// A block device of the source: its host path there and its index (the
-/// QEMU node `drive-<index>`, which names its SCSI address or its slot).
+/// QEMU node `drive-<index>`, which names its SCSI address).
 /// `copy`: the device's content is the source host's alone (a tenant root
 /// file), and travels with the VM: the source mirrors it into the
 /// destination's own device, which the destination exports for that
 /// (QEMU's block copy over NBD, as libvirt's).
+/// `bus` and `slot` (ADR-058): the PCI place of a virtio-blk device
+/// hot-plugged on a bridge, which the destination gives it again; a SCSI
+/// disk, or one of the command line, has none.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BlockPin {
@@ -33,6 +36,20 @@ pub struct BlockPin {
     pub index: u64,
     #[serde(default)]
     pub copy: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bus: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<i64>,
+}
+
+impl BlockPin {
+    /// The PCI place, when the device has one.
+    pub fn place(&self) -> Option<(String, i64)> {
+        match (&self.bus, self.slot) {
+            (Some(bus), Some(slot)) => Some((bus.clone(), slot)),
+            _ => None,
+        }
+    }
 }
 
 /// A network device of the source: its guest MAC and its PCI place.
@@ -106,6 +123,14 @@ impl MigrateIn {
         indexes
     }
 
+    /// The PCI place of each block device that had one, by index.
+    pub fn block_places(&self) -> HashMap<u64, (String, i64)> {
+        self.blocks
+            .iter()
+            .filter_map(|pin| pin.place().map(|place| (pin.index, place)))
+            .collect()
+    }
+
     pub fn network_pin(&self, mac: &str) -> Option<&NetworkPin> {
         let mac = mac.to_ascii_lowercase();
         self.networks.iter().find(|pin| pin.mac == mac)
@@ -157,20 +182,33 @@ fn validate_pins(blocks: &[BlockPin], networks: &[NetworkPin]) -> Result<()> {
     }
     let mut paths = std::collections::HashSet::new();
     let mut indexes = std::collections::HashSet::new();
+    // Disks and NICs share the bridges' slots.
+    let mut places = std::collections::HashSet::new();
     for pin in blocks {
-        if !pin.path.starts_with('/') || !paths.insert(&pin.path) || !indexes.insert(pin.index)
+        let place_ok = match (&pin.bus, pin.slot) {
+            (None, None) => true,
+            (Some(bus), Some(slot)) => {
+                bus.starts_with("pci-bridge-")
+                    && (1..=31).contains(&slot)
+                    && places.insert((bus.clone(), slot))
+            }
+            _ => false,
+        };
+        if !pin.path.starts_with('/')
+            || !paths.insert(&pin.path)
+            || !indexes.insert(pin.index)
+            || !place_ok
         {
-            bail!("migration_invalid: a block device's path or index");
+            bail!("migration_invalid: a block device's path, index or place");
         }
     }
     let mut macs = std::collections::HashSet::new();
-    let mut places = std::collections::HashSet::new();
     for pin in networks {
         if !canonical_mac(&pin.mac)
             || !macs.insert(&pin.mac)
             || !pin.bus.starts_with("pci-bridge-")
             || !(1..=31).contains(&pin.slot)
-            || !places.insert((&pin.bus, pin.slot))
+            || !places.insert((pin.bus.clone(), pin.slot))
         {
             bail!("migration_invalid: a network device's MAC or place");
         }
@@ -315,6 +353,34 @@ mod tests {
         assert_eq!(got.block_pins().get("/dev/rbd3"), Some(&2));
         assert_eq!(got.copied_indexes(), vec![1]);
         assert_eq!(got.network_pin("FA:16:3E:00:00:01").unwrap().slot, 1);
+        assert!(got.block_places().is_empty());
+    }
+
+    #[test]
+    fn a_disk_keeps_its_pci_place() {
+        let body = r#"{"version":1,"source_generation":"g1","uri":"tcp:0.0.0.0:47000",
+            "blocks":[{"path":"/dev/rbd3","index":2,"bus":"pci-bridge-0","slot":3}],
+            "networks":[{"mac":"fa:16:3e:00:00:01","bus":"pci-bridge-0","slot":1}]}"#;
+        let got = migrate_in(&request(body)).unwrap().unwrap();
+        assert_eq!(
+            got.block_places().get(&2),
+            Some(&("pci-bridge-0".to_string(), 3))
+        );
+        // A place half given, off a bridge, or a NIC's.
+        for blocks in [
+            r#"[{"path":"/dev/rbd3","index":2,"bus":"pci-bridge-0"}]"#,
+            r#"[{"path":"/dev/rbd3","index":2,"slot":3}]"#,
+            r#"[{"path":"/dev/rbd3","index":2,"bus":"pcie.0","slot":3}]"#,
+            r#"[{"path":"/dev/rbd3","index":2,"bus":"pci-bridge-0","slot":32}]"#,
+            r#"[{"path":"/dev/rbd3","index":2,"bus":"pci-bridge-0","slot":1}]"#,
+        ] {
+            let body = format!(
+                r#"{{"version":1,"source_generation":"g1","uri":"tcp:0.0.0.0:47000",
+                "blocks":{blocks},
+                "networks":[{{"mac":"fa:16:3e:00:00:01","bus":"pci-bridge-0","slot":1}}]}}"#
+            );
+            assert!(migrate_in(&request(&body)).is_err(), "{blocks}");
+        }
     }
 
     #[test]
