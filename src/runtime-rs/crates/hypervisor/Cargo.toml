@@ -86,6 +86,8 @@ dragonball = { workspace = true, features = [
     "virtio-mem",
     "virtio-balloon",
     "virtio-rng",
+    # The guest image without a virtio-blk name (ADR-058).
+    "virtio-pmem",
     "vhost-user-net",
     # Nova shares (ADR-045): an external virtiofsd per share.
     "vhost-user-fs",

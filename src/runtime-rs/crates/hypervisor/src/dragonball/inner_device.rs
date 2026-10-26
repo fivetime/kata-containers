@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use super::{build_dragonball_network_config, DragonballInner};
 use crate::VhostUserConfig;
-use crate::{device::pci_path::PciPath, KATA_BLK_DEV_TYPE};
+use crate::{device::pci_path::PciPath, KATA_BLK_DEV_TYPE, KATA_NVDIMM_DEV_TYPE};
 use crate::{
     device::DeviceType, HybridVsockConfig, NetworkConfig, ShareFsConfig, ShareFsMountConfig,
     ShareFsMountOperation, ShareFsMountType, VfioDevice, VmmState, DEFAULT_HOTPLUG_TIMEOUT,
@@ -26,6 +26,7 @@ use dragonball::api::v1::{
 use dragonball::config_manager::{RateLimiterConfigInfo, TokenBucketConfigInfo};
 use dragonball::device_manager::{
     blk_dev_mgr::BlockDeviceType,
+    pmem_dev_mgr::PmemDeviceConfigInfo,
     vfio_dev_mgr::{HostDeviceConfig, VfioPciDeviceConfig},
 };
 use kata_types::config::hypervisor::DEFAULT_RATE_LIMITER_REFILL_TIME;
@@ -151,6 +152,22 @@ impl DragonballInner {
                         cfg.io_limits,
                     )
                 };
+                // The guest image on virtio-pmem (the device manager's
+                // "nvdimm") takes no virtio-blk name; the guest mounts it
+                // with DAX (ADR-058).
+                if driver_option == KATA_NVDIMM_DEV_TYPE {
+                    info!(sl!(), "pmem device: path={}, readonly={}", path_on_host, is_readonly);
+                    self.vmm_instance
+                        .insert_pmem_device(PmemDeviceConfigInfo {
+                            path_on_host,
+                            is_read_only: is_readonly,
+                            use_shared_irq: None,
+                            use_generic_irq: None,
+                        })
+                        .context("add pmem device")?;
+                    return Ok(DeviceType::BlockModern(block_device));
+                }
+
                 // Refused before the device reaches the VMM (ADR-051).
                 let rate_limiter = io_limits
                     .as_ref()

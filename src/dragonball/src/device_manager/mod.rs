@@ -130,6 +130,12 @@ use self::balloon_dev_mgr::BalloonDeviceMgr;
 pub mod rng_dev_mgr;
 #[cfg(feature = "virtio-rng")]
 use self::rng_dev_mgr::RngDeviceMgr;
+
+#[cfg(feature = "virtio-pmem")]
+/// Device manager for virtio-pmem devices.
+pub mod pmem_dev_mgr;
+#[cfg(feature = "virtio-pmem")]
+use self::pmem_dev_mgr::PmemDeviceMgr;
 #[cfg(feature = "host-device")]
 /// Device manager for PCI/MMIO VFIO devices.
 pub mod vfio_dev_mgr;
@@ -684,6 +690,9 @@ pub struct DeviceManager {
 
     #[cfg(feature = "virtio-rng")]
     pub(crate) rng_manager: RngDeviceMgr,
+
+    #[cfg(feature = "virtio-pmem")]
+    pub(crate) pmem_manager: PmemDeviceMgr,
     #[cfg(feature = "host-device")]
     pub(crate) vfio_manager: Arc<Mutex<VfioDeviceMgr>>,
     #[cfg(feature = "host-device")]
@@ -762,6 +771,8 @@ impl DeviceManager {
             balloon_manager: BalloonDeviceMgr::default(),
             #[cfg(feature = "virtio-rng")]
             rng_manager: RngDeviceMgr::default(),
+            #[cfg(feature = "virtio-pmem")]
+            pmem_manager: PmemDeviceMgr::default(),
             #[cfg(feature = "host-device")]
             vfio_manager: Arc::new(Mutex::new(VfioDeviceMgr::new(
                 vm_fd,
@@ -985,6 +996,11 @@ impl DeviceManager {
         self.rng_manager
             .attach_devices(&mut ctx)
             .map_err(StartMicroVmError::RngDeviceError)?;
+
+        #[cfg(feature = "virtio-pmem")]
+        self.pmem_manager
+            .attach_devices(&mut ctx)
+            .map_err(StartMicroVmError::PmemDeviceError)?;
 
         #[cfg(any(feature = "virtio-blk", feature = "vhost-user-blk"))]
         let kernel_config = {
@@ -1739,6 +1755,8 @@ mod tests {
                 balloon_manager: BalloonDeviceMgr::default(),
                 #[cfg(feature = "virtio-rng")]
                 rng_manager: RngDeviceMgr::default(),
+                #[cfg(feature = "virtio-pmem")]
+                pmem_manager: PmemDeviceMgr::default(),
                 #[cfg(target_arch = "aarch64")]
                 mmio_device_info: HashMap::new(),
                 #[cfg(feature = "host-device")]

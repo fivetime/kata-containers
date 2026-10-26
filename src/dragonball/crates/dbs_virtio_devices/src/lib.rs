@@ -58,6 +58,9 @@ pub mod balloon;
 #[cfg(feature = "virtio-rng")]
 pub mod rng;
 
+#[cfg(feature = "virtio-pmem")]
+pub mod pmem;
+
 #[cfg(feature = "vhost")]
 pub mod vhost;
 

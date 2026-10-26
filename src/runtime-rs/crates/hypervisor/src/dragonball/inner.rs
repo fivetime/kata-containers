@@ -199,7 +199,15 @@ impl DragonballInner {
 
         if self.config.boot_info.initrd.is_empty() {
             // When booting from the image, add rootfs and verity parameters here.
-            let rootfs_driver = self.config.blockdev_info.block_device_driver.clone();
+            // The image's own driver: on virtio-pmem the root is
+            // /dev/pmem0p1, mounted with DAX (ADR-058).
+            let rootfs_driver = if self.config.boot_info.vm_rootfs_driver
+                == crate::VM_ROOTFS_DRIVER_PMEM
+            {
+                self.config.boot_info.vm_rootfs_driver.clone()
+            } else {
+                self.config.blockdev_info.block_device_driver.clone()
+            };
             let mut rootfs_params = KernelParams::new_rootfs_kernel_params(
                 &self.config.boot_info.kernel_verity_params,
                 &rootfs_driver,

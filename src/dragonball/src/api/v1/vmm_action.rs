@@ -47,6 +47,8 @@ pub use crate::device_manager::net_dev_mgr::{
 };
 #[cfg(feature = "virtio-rng")]
 pub use crate::device_manager::rng_dev_mgr::{RngDeviceConfigInfo, RngDeviceError};
+#[cfg(feature = "virtio-pmem")]
+pub use crate::device_manager::pmem_dev_mgr::{PmemDeviceConfigInfo, PmemDeviceError};
 #[cfg(feature = "host-device")]
 use crate::device_manager::vfio_dev_mgr::{HostDeviceConfig, VfioDeviceError};
 #[cfg(feature = "virtio-vsock")]
@@ -155,6 +157,11 @@ pub enum VmmActionError {
     /// Rng device related errors.
     #[error("virtio-rng device error: {0}")]
     Rng(#[source] RngDeviceError),
+
+    #[cfg(feature = "virtio-pmem")]
+    /// Pmem device related errors.
+    #[error("virtio-pmem device error: {0}")]
+    Pmem(#[source] PmemDeviceError),
     /// Setup tracing Failed.
     #[error("Setup tracing failed: {0}")]
     SetupTracingFailed(#[source] TraceError),
@@ -330,6 +337,11 @@ pub enum VmmAction {
     /// as input. This action can only be called before the microVM has booted.
     InsertRngDevice(RngDeviceConfigInfo),
 
+    #[cfg(feature = "virtio-pmem")]
+    /// Add a new pmem device or update one using the `PmemDeviceConfigInfo` as input. This
+    /// action can only be called before the microVM has booted.
+    InsertPmemDevice(PmemDeviceConfigInfo),
+
     #[cfg(feature = "host-device")]
     /// Add a VFIO assignment host device or update that already exists
     InsertHostDevice(HostDeviceConfig),
@@ -502,6 +514,10 @@ impl VmmService {
             }
             #[cfg(feature = "virtio-rng")]
             VmmAction::InsertRngDevice(rng_cfg) => self.add_rng_device(vmm, event_mgr, rng_cfg),
+            #[cfg(feature = "virtio-pmem")]
+            VmmAction::InsertPmemDevice(pmem_cfg) => {
+                self.add_pmem_device(vmm, event_mgr, pmem_cfg)
+            }
             #[cfg(feature = "host-device")]
             VmmAction::InsertHostDevice(mut hostdev_cfg) => {
                 self.add_vfio_device(vmm, &mut hostdev_cfg)
@@ -1302,6 +1318,39 @@ impl VmmService {
             .insert_or_update_device(ctx, config)
             .map(|_| VmmData::Empty)
             .map_err(VmmActionError::Rng)
+    }
+
+    #[cfg(feature = "virtio-pmem")]
+    #[instrument(skip(self, event_mgr))]
+    fn add_pmem_device(
+        &mut self,
+        vmm: &mut Vmm,
+        event_mgr: &mut EventManager,
+        config: PmemDeviceConfigInfo,
+    ) -> VmmRequestResult {
+        let vm = vmm.get_vm_mut().ok_or(VmmActionError::InvalidVMID)?;
+
+        if vm.is_vm_initialized() {
+            return Err(VmmActionError::Pmem(
+                PmemDeviceError::UpdateNotAllowedPostBoot,
+            ));
+        }
+
+        let ctx = vm
+            .create_device_op_context(Some(event_mgr.epoll_manager()))
+            .map_err(|e| {
+                if let StartMicroVmError::UpcallServerNotReady = e {
+                    VmmActionError::UpcallServerNotReady
+                } else {
+                    VmmActionError::StartMicroVm(e)
+                }
+            })?;
+
+        vm.device_manager_mut()
+            .pmem_manager
+            .insert_or_update_device(ctx, config)
+            .map(|_| VmmData::Empty)
+            .map_err(VmmActionError::Pmem)
     }
 }
 
