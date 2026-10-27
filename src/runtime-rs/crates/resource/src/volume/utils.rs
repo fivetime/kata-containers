@@ -120,6 +120,12 @@ pub(crate) async fn generate_shared_path(
     let host_path = do_get_host_path(&mount_name, sid, device_id, true, false);
 
     if get_mount_path(&Some(dest)).starts_with("/dev") {
+        // Nova Kata (ADR-058): a container whose volumes are plugged before
+        // its root (a stable device rescue) has no directory here yet.
+        if let Some(parent) = std::path::Path::new(&host_path).parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| anyhow!("failed to create dir {}: {:?}", parent.display(), e))?;
+        }
         fs::File::create(&host_path).context(format!("failed to create file {:?}", &host_path))?;
     } else {
         std::fs::create_dir_all(&host_path)
