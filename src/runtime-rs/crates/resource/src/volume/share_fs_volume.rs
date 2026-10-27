@@ -426,7 +426,15 @@ impl ShareFsVolume {
             .unwrap()
             .to_str()
             .unwrap();
-        let file_name = generate_mount_path("sandbox", file_name);
+        // Nova Kata (ADR-052, ADR-058): a name both ends of a live migration
+        // give it, by the container and the destination: virtio-fs carries
+        // its open files by their names in the shared directory (the config
+        // drive's ISO). The container's mounts have distinct destinations.
+        let file_name = stable_mount_path(
+            cid,
+            &m.destination().to_string_lossy(),
+            file_name,
+        );
 
         let mut volume = Self {
             share_fs: share_fs.as_ref().map(Arc::clone),
