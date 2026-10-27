@@ -24,10 +24,23 @@ use kata_types::fs::VM_ROOTFS_FILESYSTEM_XFS;
 use kata_types::mount::Mount;
 use nix::sys::stat::{self, SFlag};
 use oci_spec::runtime as oci;
+use std::collections::HashMap;
 use std::fs;
 use tokio::sync::RwLock;
 
 const BLOCKFILE_ROOTFS_FLAG: &str = "loop";
+
+/// Nova Kata (ADR-058): the Cinder volume a root is, named by the gateway.
+pub(crate) const ROOT_VOLUME_ANNOTATION: &str = "io.openstack.nova.kata.root-volume.v1";
+
+/// The serial of a root disk: its Cinder volume's ID as the guest reads it
+/// (20 bytes), as libvirt gives a volume; a root of an image has none.
+pub(crate) fn root_volume_serial(annotations: &HashMap<String, String>) -> String {
+    annotations
+        .get(ROOT_VOLUME_ANNOTATION)
+        .map(|volume| volume.chars().take(20).collect())
+        .unwrap_or_default()
+}
 
 pub(crate) struct BlockRootfs {
     guest_path: String,
@@ -43,6 +56,7 @@ impl BlockRootfs {
         cid: &str,
         dev_id: u64,
         rootfs: &Mount,
+        serial: String,
     ) -> Result<Self> {
         let container_path = do_get_guest_path(ROOTFS, cid, false, false);
         let host_path = do_get_host_path(ROOTFS, sid, cid, false, false);
@@ -63,6 +77,7 @@ impl BlockRootfs {
             queue_size: blkdev_info.queue_size,
             logical_sector_size: blkdev_info.block_device_logical_sector_size,
             physical_sector_size: blkdev_info.block_device_physical_sector_size,
+            serial_override: serial,
             ..Default::default()
         };
 
@@ -183,4 +198,21 @@ pub(crate) fn is_block_rootfs(m: &Mount) -> Option<(u64, Mount)> {
         Err(_) => return None,
     };
     None
+}
+
+#[cfg(test)]
+mod nova_root_serial_tests {
+    use super::{root_volume_serial, ROOT_VOLUME_ANNOTATION};
+    use std::collections::HashMap;
+
+    #[test]
+    fn nova_root_serial_is_the_cinder_volumes_or_none() {
+        let mut annotations = HashMap::new();
+        assert_eq!(root_volume_serial(&annotations), "");
+        annotations.insert(
+            ROOT_VOLUME_ANNOTATION.to_owned(),
+            "5b0c1d2e-3f40-4a5b-8c6d-7e8f90a1b2c3".to_owned(),
+        );
+        assert_eq!(root_volume_serial(&annotations), "5b0c1d2e-3f40-4a5b-8");
+    }
 }

@@ -132,9 +132,16 @@ impl RootFsResource {
                     // handle block rootfs
                     info!(sl!(), "block device: {}", dev_id);
                     let block_rootfs: Arc<dyn Rootfs> = Arc::new(
-                        block_rootfs::BlockRootfs::new(device_manager, sid, cid, dev_id, &layer)
-                            .await
-                            .context("new block rootfs")?,
+                        block_rootfs::BlockRootfs::new(
+                            device_manager,
+                            sid,
+                            cid,
+                            dev_id,
+                            &layer,
+                            block_rootfs::root_volume_serial(annotations),
+                        )
+                        .await
+                        .context("new block rootfs")?,
                     );
                     Ok(block_rootfs)
                 } else if let Some(share_fs) = share_fs {
