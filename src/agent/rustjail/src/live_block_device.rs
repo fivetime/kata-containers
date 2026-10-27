@@ -87,8 +87,11 @@ fn by_id_directory(directory: &File, create: bool) -> Result<File> {
     open_directory(&disk, "by-id", create)
 }
 
+// The target is absolute, /dev/<name>: the tenant image's own link keeper
+// (openstack-nova-kata's nova-kata-blockdev, which stands in for udev)
+// removes the relative links it does not compute, and leaves these alone.
 fn link_in(by: &File, link: &str, name: &str) -> Result<()> {
-    let target = CString::new(format!("../../{name}"))?;
+    let target = CString::new(format!("/dev/{name}"))?;
     let link = CString::new(link)?;
     if unsafe { libc::symlinkat(target.as_ptr(), by.as_raw_fd(), link.as_ptr()) } != 0 {
         return Err(io::Error::last_os_error()).context("link workload block node");
@@ -424,7 +427,7 @@ mod tests {
         let directory = File::open(dev.path()).unwrap();
         create_link(&directory, "virtio-0123abcd-0123-4567-8", "vdb").unwrap();
         let link = dev.path().join("disk/by-id/virtio-0123abcd-0123-4567-8");
-        assert_eq!(std::fs::read_link(&link).unwrap(), std::path::Path::new("../../vdb"));
+        assert_eq!(std::fs::read_link(&link).unwrap(), std::path::Path::new("/dev/vdb"));
         assert!(create_link(&directory, "virtio-0123abcd-0123-4567-8", "vdc").is_err());
         remove_link(&directory, "virtio-0123abcd-0123-4567-8").unwrap();
         remove_link(&directory, "virtio-0123abcd-0123-4567-8").unwrap();
