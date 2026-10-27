@@ -1521,6 +1521,27 @@ impl Qmp {
         Err(anyhow!("no target device found"))
     }
 
+    /// Nova Kata (ADR-058): the PCI path of the device in `slot` of the
+    /// bridge `bridge_id`, from the bridge's own place. A VM that waits for
+    /// an incoming migration has run no firmware, so its bridges have no
+    /// bus numbers yet and query-pci lists nothing behind them.
+    fn pci_path_on_bridge(&mut self, bridge_id: &str, slot: i64) -> Result<PciPath> {
+        let mut path = vec![];
+        let pci = self.qmp.execute(&qapi_qmp::query_pci {})?;
+        for pci_info in pci.iter() {
+            if get_pci_path_by_qdev_id(&pci_info.devices, bridge_id, &mut path).is_some() {
+                path.push(slot);
+                let text = path
+                    .iter()
+                    .map(|num| format!("{num:02x}"))
+                    .collect::<Vec<String>>()
+                    .join("/");
+                return PciPath::try_from(text.as_str());
+            }
+        }
+        Err(anyhow!("bridge {bridge_id} not found"))
+    }
+
     /// Execute device_add for a block device. On failure, automatically
     /// rolls back the blockdev node added earlier to avoid orphaned resources.
     fn device_add_with_rollback(
@@ -1979,9 +2000,13 @@ impl Qmp {
             )?;
             self.set_block_io_limits(&node_name, io_limits)?;
 
-            let pci_path = self
-                .get_device_by_qdev_id(&node_name)
-                .context("get device by qdev_id failed")?;
+            let pci_path = match self.get_device_by_qdev_id(&node_name) {
+                Ok(path) => path,
+                Err(_) if self.block_pins.contains_key(&index) => self
+                    .pci_path_on_bridge(&bus, slot)
+                    .context("get device by its bridge failed")?,
+                Err(err) => return Err(err.context("get device by qdev_id failed")),
+            };
             self.record_pci_bridge_slot(&bus, slot, &node_name);
             info!(
                 sl!(),
