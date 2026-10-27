@@ -222,6 +222,11 @@ pub struct BlockDeviceConfigInfo {
     pub use_generic_irq: Option<bool>,
     /// Use pci bus
     pub use_pci_bus: Option<bool>,
+    /// The disk's virtio serial (VIRTIO_BLK_T_GET_ID), at most 20 bytes.
+    /// None derives one from the backing file's device and inode numbers;
+    /// an empty one gives the guest none (Nova Kata ADR-058).
+    #[serde(default)]
+    pub serial: Option<String>,
 }
 
 impl std::default::Default for BlockDeviceConfigInfo {
@@ -242,6 +247,7 @@ impl std::default::Default for BlockDeviceConfigInfo {
             use_shared_irq: None,
             use_generic_irq: None,
             use_pci_bus: None,
+            serial: None,
         }
     }
 }
@@ -761,7 +767,8 @@ impl BlockDeviceMgr {
             epoll_mgr,
             limiters,
             f_access_platform,
-        )?))
+        )?
+        .with_serial(cfg.serial.clone())))
     }
 
     #[cfg(feature = "vhost-user-blk")]
@@ -1226,6 +1233,7 @@ mod tests {
             use_shared_irq: None,
             use_generic_irq: None,
             use_pci_bus: Some(true),
+            serial: None,
         };
 
         let mut vm = crate::vm::tests::create_vm_instance();
@@ -1303,6 +1311,7 @@ mod tests {
             use_shared_irq: None,
             use_generic_irq: None,
             use_pci_bus: Some(true),
+            serial: None,
         };
         let (sender, _receiver) = channel();
         vm.device_manager_mut()
@@ -1382,6 +1391,7 @@ mod tests {
             use_shared_irq: None,
             use_generic_irq: None,
             use_pci_bus: Some(true),
+            serial: None,
         };
 
         let mut vm = crate::vm::tests::create_vm_instance();
@@ -1425,6 +1435,7 @@ mod tests {
             use_shared_irq: None,
             use_generic_irq: None,
             use_pci_bus: Some(true),
+            serial: None,
         };
 
         let dummy_file_2 = TempFile::new().unwrap();
@@ -1445,6 +1456,7 @@ mod tests {
             use_shared_irq: None,
             use_generic_irq: None,
             use_pci_bus: Some(true),
+            serial: None,
         };
 
         let mut vm = crate::vm::tests::create_vm_instance();
@@ -1484,6 +1496,7 @@ mod tests {
             use_shared_irq: None,
             use_generic_irq: None,
             use_pci_bus: Some(true),
+            serial: None,
         };
 
         let dummy_file_2 = TempFile::new().unwrap();
@@ -1504,6 +1517,7 @@ mod tests {
             use_shared_irq: None,
             use_generic_irq: None,
             use_pci_bus: Some(true),
+            serial: None,
         };
 
         let dummy_file_3 = TempFile::new().unwrap();
@@ -1524,6 +1538,7 @@ mod tests {
             use_shared_irq: None,
             use_generic_irq: None,
             use_pci_bus: Some(true),
+            serial: None,
         };
 
         let mut vm = crate::vm::tests::create_vm_instance();
@@ -1586,6 +1601,7 @@ mod tests {
             use_shared_irq: None,
             use_generic_irq: None,
             use_pci_bus: Some(true),
+            serial: None,
         };
 
         let dummy_file_2 = TempFile::new().unwrap();
@@ -1606,6 +1622,7 @@ mod tests {
             use_shared_irq: None,
             use_generic_irq: None,
             use_pci_bus: Some(true),
+            serial: None,
         };
 
         let dummy_file_3 = TempFile::new().unwrap();
@@ -1626,6 +1643,7 @@ mod tests {
             use_shared_irq: None,
             use_generic_irq: None,
             use_pci_bus: Some(true),
+            serial: None,
         };
 
         let mut vm = crate::vm::tests::create_vm_instance();
@@ -1689,6 +1707,7 @@ mod tests {
             use_shared_irq: None,
             use_generic_irq: None,
             use_pci_bus: Some(true),
+            serial: None,
         };
 
         let dummy_file_2 = TempFile::new().unwrap();
@@ -1709,6 +1728,7 @@ mod tests {
             use_shared_irq: None,
             use_generic_irq: None,
             use_pci_bus: Some(true),
+            serial: None,
         };
 
         let mut vm = crate::vm::tests::create_vm_instance();
@@ -1807,6 +1827,7 @@ mod tests {
             use_shared_irq: None,
             use_generic_irq: None,
             use_pci_bus: Some(true),
+            serial: None,
         };
         let root_block_device_new = BlockDeviceConfigInfo {
             path_on_host: dummy_path_2,
@@ -1824,6 +1845,7 @@ mod tests {
             use_shared_irq: None,
             use_generic_irq: None,
             use_pci_bus: Some(true),
+            serial: None,
         };
         let ctx = DeviceOpContext::create_boot_ctx(&vm, None);
         vm.device_manager_mut()

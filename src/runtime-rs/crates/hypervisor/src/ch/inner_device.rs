@@ -526,18 +526,6 @@ impl CloudHypervisorInner {
                         continue;
                     }
 
-                    // The disk configuration has no serial field, so a device
-                    // the guest finds by serial would be unusable.
-                    if !config.serial_override.is_empty() {
-                        warn!(
-                            sl!(),
-                            "not cold-plugging block device {:?}: its serial {:?} cannot be expressed",
-                            config.path_on_host,
-                            config.serial_override
-                        );
-                        continue;
-                    }
-
                     info!(sl!(), "cold-plugging block device {:?}", &config);
 
                     boot_disks.push(self.make_disk_config(&config)?);
@@ -657,6 +645,7 @@ impl TryFrom<BlockConfigModern> for DiskConfig {
             queue_size: blkcfg.queue_size as u16,
             sparse: blkcfg.discard_unmap,
             image_type: ImageType::Raw,
+            serial: Some(blkcfg.serial_override.clone()),
             ..Default::default()
         };
 
@@ -785,5 +774,30 @@ mod nova_shares_ch_tests {
         assert!(main.id.is_none() && share.id.is_none());
         assert_ne!(main.tag, share.tag);
         assert_ne!(main.socket, share.socket);
+    }
+}
+
+#[cfg(test)]
+mod nova_disk_serial_ch_tests {
+    use super::*;
+
+    #[test]
+    fn nova_disk_serial_ch_is_the_given_one_or_none() {
+        let disk = DiskConfig::try_from(BlockConfigModern {
+            path_on_host: "/dev/rbd0".into(),
+            serial_override: "5b0c1d2e-3f40-4a5b-8".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(disk.serial.as_deref(), Some("5b0c1d2e-3f40-4a5b-8"));
+        let disk = DiskConfig::try_from(BlockConfigModern {
+            path_on_host: "/dev/rbd1".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        // Empty, not None: Cloud Hypervisor would make one up from the
+        // backing file's device and inode numbers.
+        assert_eq!(disk.serial.as_deref(), Some(""));
+        assert!(serde_json::to_string(&disk).unwrap().contains("\"serial\":\"\""));
     }
 }

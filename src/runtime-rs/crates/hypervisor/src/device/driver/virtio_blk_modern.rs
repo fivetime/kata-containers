@@ -175,10 +175,10 @@ pub struct BlockConfigModern {
     /// Physical sector size in bytes reported to the guest. 0 means use hypervisor default.
     pub physical_sector_size: u32,
 
-    /// Override the QEMU virtio serial for this device.
-    /// When set, the device is discoverable in the guest via
-    /// `/dev/disk/by-id/virtio-<serial>`.
-    /// If empty, the default `image-{device_id}` serial is used.
+    /// The device's virtio serial under every VMM. When set, the guest
+    /// finds the device as `/dev/disk/by-id/virtio-<serial>`; when empty,
+    /// the guest sees no serial, as libvirt gives a disk that is not a
+    /// volume (Nova Kata ADR-058).
     pub serial_override: String,
 
     /// Limits of this device alone, from its direct volume's metadata
@@ -289,5 +289,32 @@ impl Device for BlockDeviceModernHandle {
     async fn decrease_attach_count(&mut self) -> Result<bool> {
         let mut guard = self.inner.lock().await;
         do_decrease_count(&mut guard.attach_count)
+    }
+}
+
+/// The serial of a disk the container finds at `path`: a Nova volume's
+/// `/dev/disk/by-id/virtio-<serial>` names it, as udev names a disk by
+/// its serial. Any other path gives none (Nova Kata ADR-058).
+pub fn serial_of_by_id_path(path: &str) -> String {
+    path.strip_prefix("/dev/disk/by-id/virtio-")
+        .filter(|serial| !serial.is_empty() && !serial.contains('/'))
+        .map(str::to_owned)
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod nova_serial_tests {
+    use super::serial_of_by_id_path;
+
+    #[test]
+    fn nova_serial_of_by_id_path() {
+        assert_eq!(
+            serial_of_by_id_path("/dev/disk/by-id/virtio-5b0c1d2e-3f40-4a5b-8"),
+            "5b0c1d2e-3f40-4a5b-8"
+        );
+        assert_eq!(serial_of_by_id_path("/dev/vdb"), "");
+        assert_eq!(serial_of_by_id_path("/dev/disk/by-id/virtio-"), "");
+        assert_eq!(serial_of_by_id_path("/dev/disk/by-id/virtio-a/b"), "");
+        assert_eq!(serial_of_by_id_path("/dev/disk/by-id/scsi-0QEMU"), "");
     }
 }

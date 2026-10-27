@@ -138,6 +138,7 @@ impl DragonballInner {
                     driver_option,
                     sparse,
                     io_limits,
+                    serial,
                 ) = {
                     let dev = block_device.lock().await;
                     let cfg = &dev.config;
@@ -150,6 +151,7 @@ impl DragonballInner {
                         cfg.driver_option.clone(),
                         cfg.discard_unmap,
                         cfg.io_limits,
+                        cfg.serial_override.clone(),
                     )
                 };
                 // The guest image on virtio-pmem (the device manager's
@@ -200,6 +202,7 @@ impl DragonballInner {
                         use_pci_bus,
                         sparse,
                         rate_limiter,
+                        Some(serial),
                     )
                     .context("add block modern device")?;
 
@@ -228,6 +231,7 @@ impl DragonballInner {
                     None,
                     None,
                     false,
+                    None,
                     None,
                 )
                 .context("add vhost user based block device")?;
@@ -361,6 +365,7 @@ impl DragonballInner {
         use_pci_bus: Option<bool>,
         sparse: bool,
         rate_limiter: Option<RateLimiterConfigInfo>,
+        serial: Option<String>,
     ) -> Result<Option<i32>> {
         let jailed_drive = self.get_resource(path, id).context("get resource")?;
         self.cached_block_devices.insert(id.to_string());
@@ -396,6 +401,7 @@ impl DragonballInner {
             use_pci_bus,
             sparse,
             rate_limiter: Some(rate_limiter.unwrap_or(block_rate_limit)),
+            serial,
             ..Default::default()
         };
         info!(

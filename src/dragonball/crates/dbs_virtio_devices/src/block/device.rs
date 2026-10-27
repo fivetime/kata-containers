@@ -47,6 +47,16 @@ const CONFIG_SPACE_SIZE: usize = 64;
 /// Max segments in a data request.
 const CONFIG_MAX_SEG: u32 = 16;
 
+/// A given serial as the guest reads it: at most VIRTIO_BLK_ID_BYTES,
+/// zero-padded; an empty one reads as none.
+fn padded_device_id(serial: &str) -> Vec<u8> {
+    let mut id = vec![0; VIRTIO_BLK_ID_BYTES as usize];
+    let bytes = serial.as_bytes();
+    let len = std::cmp::min(bytes.len(), VIRTIO_BLK_ID_BYTES as usize);
+    id[..len].clone_from_slice(&bytes[..len]);
+    id
+}
+
 fn build_device_id(disk_image: &dyn Ufile) -> Vec<u8> {
     let mut default_disk_image_id = vec![0; VIRTIO_BLK_ID_BYTES as usize];
     match disk_image.get_device_id() {
@@ -74,6 +84,8 @@ pub struct Block<AS: DbsGuestAddressSpace> {
     epoll_threads: Vec<thread::JoinHandle<()>>,
     /// Tells the guest that the configuration changed, once activated.
     device_change_notifier: Option<Arc<dyn InterruptNotifier>>,
+    /// The serial given to the guest; None derives one from the disk image.
+    serial: Option<String>,
     phantom: PhantomData<AS>,
 }
 
@@ -158,7 +170,15 @@ impl<AS: DbsGuestAddressSpace> Block<AS> {
             kill_evts: Vec::with_capacity(num_queues),
             epoll_threads: Vec::with_capacity(num_queues),
             device_change_notifier: None,
+            serial: None,
         })
+    }
+
+    /// Give the guest this serial instead of one derived from the disk
+    /// image; an empty one gives it none (Nova Kata ADR-058).
+    pub fn with_serial(mut self, serial: Option<String>) -> Self {
+        self.serial = serial;
+        self
     }
 
     /// The capacity the guest is shown, in bytes.
@@ -385,7 +405,10 @@ where
         config.queues.reverse();
         while let Some(queue) = config.queues.pop() {
             let disk_image = self.disk_images.pop().unwrap();
-            let disk_image_id = build_device_id(disk_image.as_ref());
+            let disk_image_id = match &self.serial {
+                Some(serial) => padded_device_id(serial),
+                None => build_device_id(disk_image.as_ref()),
+            };
 
             let data_desc_vec =
                 vec![Vec::with_capacity(CONFIG_MAX_SEG as usize); self.queue_sizes[0] as usize];
@@ -1691,5 +1714,25 @@ mod tests {
         .unwrap();
         handler.pending_req_map.insert(0, req);
         handler.io_complete().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod nova_disk_serial_tests {
+    use super::padded_device_id;
+    use virtio_bindings::bindings::virtio_blk::VIRTIO_BLK_ID_BYTES;
+
+    #[test]
+    fn nova_disk_serial_is_padded_and_cut_to_the_id_size() {
+        let size = VIRTIO_BLK_ID_BYTES as usize;
+        assert_eq!(padded_device_id(""), vec![0; size]);
+        let id = padded_device_id("5b0c1d2e-3f40-4a5b-8");
+        assert_eq!(&id[..], b"5b0c1d2e-3f40-4a5b-8");
+        let id = padded_device_id("5b0c1d2e-3f40-4a5b-8c6d-7e8f90a1b2c3");
+        assert_eq!(id.len(), size);
+        assert_eq!(&id[..], b"5b0c1d2e-3f40-4a5b-8");
+        let id = padded_device_id("vol");
+        assert_eq!(&id[..3], b"vol");
+        assert!(id[3..].iter().all(|b| *b == 0));
     }
 }

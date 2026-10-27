@@ -1297,11 +1297,11 @@ impl ToQemuParams for DeviceVirtioBlk {
         if self.discard {
             params.push("discard=on".to_owned());
         }
-        let serial = match &self.serial_override {
-            Some(s) => s.clone(),
-            None => format!("image-{}", self.id),
-        };
-        params.push(format!("serial={serial}"));
+        // A disk that is not a volume has no serial, as under libvirt
+        // (Nova Kata ADR-058).
+        if let Some(serial) = self.serial_override.as_ref().filter(|s| !s.is_empty()) {
+            params.push(format!("serial={serial}"));
+        }
         if let Some(devno) = &self.devno {
             params.push(format!("devno={devno}"));
         }
@@ -4515,5 +4515,23 @@ mod nova_live_network_tests {
         assert!(params[1].ends_with(
             ",id=frontend-network-tap0_kata,bus=pci-bridge-0,addr=03"
         ));
+    }
+}
+
+#[cfg(test)]
+mod nova_disk_serial_tests {
+    use super::*;
+
+    #[actix_rt::test]
+    async fn nova_disk_serial_only_a_volume_has_one() {
+        let mut disk = DeviceVirtioBlk::new("blk0", VirtioBusType::Pci, None);
+        let params = disk.qemu_params().await.unwrap().join(",");
+        assert!(!params.contains("serial="), "{}", params);
+        disk.set_serial_override(String::new());
+        let params = disk.qemu_params().await.unwrap().join(",");
+        assert!(!params.contains("serial="), "{}", params);
+        disk.set_serial_override("5b0c1d2e-3f40-4a5b-8".to_owned());
+        let params = disk.qemu_params().await.unwrap().join(",");
+        assert!(params.contains("serial=5b0c1d2e-3f40-4a5b-8"), "{}", params);
     }
 }

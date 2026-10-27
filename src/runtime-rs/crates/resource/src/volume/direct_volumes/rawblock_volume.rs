@@ -11,7 +11,7 @@ use hypervisor::{
         device_manager::{do_handle_device, get_block_device_info, DeviceManager},
         DeviceConfig,
     },
-    BlockConfigModern, BlockDeviceAio, BlockIoLimits,
+    serial_of_by_id_path, BlockConfigModern, BlockDeviceAio, BlockIoLimits,
 };
 use kata_types::mount::DirectVolumeMountInfo;
 use nix::sys::{stat, stat::SFlag};
@@ -94,6 +94,7 @@ impl RawblockVolume {
             logical_sector_size: blkdev_info.block_device_logical_sector_size,
             physical_sector_size: blkdev_info.block_device_physical_sector_size,
             io_limits,
+            serial_override: serial_of_by_id_path(&m.destination().to_string_lossy()),
             ..Default::default()
         };
 

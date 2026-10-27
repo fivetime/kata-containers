@@ -19,7 +19,7 @@ use hypervisor::{
     },
     utils::uses_native_ccw_bus,
     vfio_device::is_vfio_ap_device,
-    BlockConfigModern, BlockDeviceAio, Hypervisor, VfioConfig,
+    serial_of_by_id_path, BlockConfigModern, BlockDeviceAio, Hypervisor, VfioConfig,
 };
 use kata_types::mount::{kata_guest_sandbox_dir, Mount, KATA_EPHEMERAL_VOLUME_TYPE, SHM_DIR};
 use kata_types::{
@@ -729,6 +729,7 @@ impl ResourceManagerInner {
                         queue_size: blkdev_info.queue_size,
                         logical_sector_size: blkdev_info.block_device_logical_sector_size,
                         physical_sector_size: blkdev_info.block_device_physical_sector_size,
+                        serial_override: serial_of_by_id_path(&d.path().to_string_lossy()),
                         ..Default::default()
                     });
 

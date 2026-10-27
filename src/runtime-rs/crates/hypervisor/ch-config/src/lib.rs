@@ -150,6 +150,11 @@ pub struct DiskConfig {
     pub sparse: bool,
     #[serde(default)]
     pub image_type: ImageType,
+    /// The disk's virtio serial; None lets Cloud Hypervisor derive one from
+    /// the backing file's device and inode numbers, an empty one gives the
+    /// guest none (Nova Kata ADR-058).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<String>,
 }
 
 pub fn default_diskconfig_sparse() -> bool {
@@ -173,6 +178,7 @@ impl Default for DiskConfig {
             pci_segment: 0,
             sparse: default_diskconfig_sparse(),
             image_type: ImageType::default(),
+            serial: None,
         }
     }
 }
