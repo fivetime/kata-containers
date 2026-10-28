@@ -1,15 +1,24 @@
-# Builds the guest agent this deployment runs, from this branch: the
-# release it is based on plus the patches carried on top. Not an upstream
-# workflow; it exists only on the branches that carry those patches.
-name: prod | build the guest agent
+# Builds the guest agent this deployment runs: upstream plus the patches
+# carried on top of it in this fork. Not an upstream workflow; it exists
+# only in this fork, on main and on the prod-* branches.
+name: fork | build the guest agent
 
 on:
-  # Pushing the branch builds it: workflow_dispatch alone would need this
-  # file on the default branch, which tracks upstream and should not carry
-  # it.
+  # main is built when what goes into the agent changes, so that syncing
+  # upstream work elsewhere in the tree does not publish a new binary each
+  # time. A prod-* branch is built on every push.
   push:
     branches:
+      - main
       - 'prod-*'
+    paths:
+      - 'src/agent/**'
+      - 'src/libs/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'VERSION'
+      - '.github/workflows/build-guest-agent.yaml'
   workflow_dispatch:
     inputs:
       release:
@@ -19,9 +28,15 @@ on:
 
 permissions: {}
 
+concurrency:
+  group: build-guest-agent-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: build and test
+    # Forks of this fork would otherwise publish releases of their own.
+    if: ${{ github.repository == 'fivetime/kata-containers' }}
     # The guest's glibc is the one of its rootfs (Ubuntu noble, 2.39).
     # A binary built against a newer one does not run there, so the
     # runner image is pinned rather than taken as latest.
@@ -39,11 +54,21 @@ jobs:
           rustup show active-toolchain
           rustup component add rustfmt clippy
 
+      # A commit with a version tag (4.2.0, v4.2.0) is named after the tag;
+      # any other is named after the branch it was built from. The
+      # checkout is shallow and has no tags, so they are asked of the
+      # remote. The release tags this workflow creates are not versions and
+      # do not match.
       - name: Record what this build is
         id: what
         run: |
+          set -o pipefail
+          head=$(git rev-parse HEAD)
+          version=$(git ls-remote --tags origin |
+            awk -v c="$head" '$1 == c { sub("^refs/tags/", "", $2); sub(/\^\{\}$/, "", $2); print $2 }' |
+            { grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+' || true; } | sort -uV | tail -1)
           echo "commit=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-          echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+          echo "label=${version:-${GITHUB_REF_NAME//\//-}}" >> "$GITHUB_OUTPUT"
           ldd --version | head -1
 
       - name: Check the formatting and the lints
@@ -64,6 +89,8 @@ jobs:
             rpc::tests::test_is_signal \
             rpc::tests::test_sigset \
             rpc::tests::test_parse_sigtimedwait
+          cargo test -p rustjail --lib -- --nocapture \
+            cgroups::fs::tests::test_memswap_limit_value
 
       # The features the deployed agent is built with: `kata-agent
       # --version` in the guest image prints them, and they must match.
@@ -97,7 +124,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="prod-agent-${{ steps.what.outputs.version }}-${{ steps.what.outputs.commit }}"
+          tag="guest-agent-${{ steps.what.outputs.label }}-${{ steps.what.outputs.commit }}"
           {
             echo "Guest agent built from \`${{ github.ref_name }}\` at ${{ github.sha }}."
             echo
@@ -110,5 +137,8 @@ jobs:
             echo "Built by \`make LIBC=gnu AGENT_POLICY=yes SECCOMP=yes BUILD_TYPE=release\`"
             echo "on \`ubuntu-24.04\`, which carries the glibc of the guest rootfs."
           } > notes.md
+          # Without --target the tag would go on the default branch's head
+          # at the time of the release, not on the commit that was built.
           gh release create "$tag" kata-agent kata-agent.sha256 \
+            --target "${{ github.sha }}" \
             --title "$tag" --notes-file notes.md --latest=false
