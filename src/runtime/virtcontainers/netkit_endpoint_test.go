@@ -110,3 +110,15 @@ func TestNetkitEndpointSaveLoad(t *testing.T) {
 	assert.Equal(endpoint.NetPair.VirtIface.Name, newEndpoint.NetPair.VirtIface.Name)
 	assert.Equal(endpoint.NetPair.NetInterworkingModel, newEndpoint.NetPair.NetInterworkingModel)
 }
+
+func TestHasNoMACAddress(t *testing.T) {
+	assert := assert.New(t)
+
+	// netkit in L3 mode: no address on older kernels, all zeros on newer ones.
+	assert.True(hasNoMACAddress(nil))
+	assert.True(hasNoMACAddress(net.HardwareAddr{}))
+	assert.True(hasNoMACAddress(net.HardwareAddr{0, 0, 0, 0, 0, 0}))
+
+	assert.False(hasNoMACAddress(net.HardwareAddr{0x02, 0x00, 0xCA, 0xFE, 0x00, 0x05}))
+	assert.False(hasNoMACAddress(net.HardwareAddr{0, 0, 0, 0, 0, 1}))
+}

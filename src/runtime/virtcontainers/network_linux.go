@@ -1036,7 +1036,7 @@ func tapNetworkPair(ctx context.Context, endpoint Endpoint, queues int, disableV
 	// bridge created by the network plugin on the host actually expects
 	// to see traffic from this MAC address and not another one.
 	tapHardAddr := attrs.HardwareAddr
-	if len(attrs.HardwareAddr) == 0 {
+	if hasNoMACAddress(attrs.HardwareAddr) {
 		// L3 devices (e.g., netkit in L3 mode) have no MAC address and are not currently supported.
 		// They require IP routing instead of L2 bridging, which is not currently implemented.
 		return fmt.Errorf("Device %s has no MAC address (netkit L3 mode is not supported - use netkit L2 mode or veth devices)", attrs.Name)
@@ -1138,7 +1138,7 @@ func setupTCFiltering(ctx context.Context, endpoint Endpoint, queues int, disabl
 	// the one inside the VM in order to avoid any firewall issues. The
 	// bridge created by the network plugin on the host actually expects
 	// to see traffic from this MAC address and not another one.
-	if len(attrs.HardwareAddr) == 0 {
+	if hasNoMACAddress(attrs.HardwareAddr) {
 		// L3 devices (e.g., netkit in L3 mode) have no MAC address and are not currently supported.
 		// They require IP routing instead of L2 bridging, which is not currently implemented.
 		return fmt.Errorf("Device %s has no MAC address (netkit L3 mode is not supported - use netkit L2 mode or veth devices)", attrs.Name)
@@ -1467,6 +1467,18 @@ func networkInfoFromLink(handle *netlink.Handle, link netlink.Link) (NetworkInfo
 
 // func addRxRateLmiter implements tc-based rx rate limiter to control network I/O inbound traffic
 // on VM level for hypervisors which don't implement rate limiter in itself, like qemu, etc.
+// hasNoMACAddress reports whether a link has no usable MAC address. L3
+// devices (e.g. netkit in L3 mode) report none or, on newer kernels, all
+// zeros.
+func hasNoMACAddress(addr net.HardwareAddr) bool {
+	for _, b := range addr {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func addRxRateLimiter(endpoint Endpoint, maxRate uint64) error {
 	var linkName string
 	switch ep := endpoint.(type) {
