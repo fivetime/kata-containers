@@ -99,7 +99,7 @@ use crate::trace_rpc_call;
 use crate::tracer::extract_carrier_from_ttrpc;
 
 #[cfg(feature = "agent-policy")]
-use crate::policy::{do_set_policy, is_allowed, is_allowed_with_entrypoint};
+use crate::policy::{do_set_policy, is_allowed, is_allowed_stateful, is_allowed_with_entrypoint};
 
 use opentelemetry::global;
 use tracing::span;
@@ -177,6 +177,21 @@ fn sandbox_err_to_ttrpc(err: SandboxError) -> ttrpc::Error {
 #[cfg(not(feature = "agent-policy"))]
 async fn is_allowed(_req: &impl serde::Serialize) -> ttrpc::Result<()> {
     Ok(())
+}
+
+#[cfg(not(feature = "agent-policy"))]
+struct PolicyStateGuard;
+
+#[cfg(not(feature = "agent-policy"))]
+impl PolicyStateGuard {
+    async fn commit(self) -> ttrpc::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(not(feature = "agent-policy"))]
+async fn is_allowed_stateful(_req: &impl serde::Serialize) -> ttrpc::Result<PolicyStateGuard> {
+    Ok(PolicyStateGuard)
 }
 
 fn same<E>(e: E) -> E {
@@ -453,37 +468,15 @@ impl AgentService {
         // Drop the host guest mapping for this container so we can reuse the
         // PCI slots for the next containers
 
-        if req.timeout == 0 {
-            let mut sandbox = self.sandbox.lock().await;
-            sandbox.bind_watcher.remove_container(&cid).await;
-            sandbox
-                .get_container(&cid)
-                .ok_or_else(|| anyhow!("Invalid container id"))?
-                .destroy()
-                .await?;
-            remove_container_resources(&mut sandbox, &cid).await?;
-            return Ok(());
-        }
-
-        // timeout != 0
-        let s = self.sandbox.clone();
-        let cid2 = cid.clone();
-        let handle = tokio::spawn(async move {
-            let mut sandbox = s.lock().await;
-            sandbox.bind_watcher.remove_container(&cid2).await;
-            sandbox
-                .get_container(&cid2)
-                .ok_or_else(|| anyhow!("Invalid container id"))?
-                .destroy()
-                .await
-        });
-
-        let to = Duration::from_secs(req.timeout.into());
-        tokio::time::timeout(to, handle)
-            .await
-            .map_err(|_| anyhow!(nix::Error::ETIME))???;
-
-        remove_container_resources(&mut *self.sandbox.lock().await, &cid).await
+        let mut sandbox = self.sandbox.lock().await;
+        sandbox.bind_watcher.remove_container(&cid).await;
+        sandbox
+            .get_container(&cid)
+            .ok_or_else(|| anyhow!("Invalid container id"))?
+            .destroy()
+            .await?;
+        remove_container_resources(&mut sandbox, &cid).await?;
+        Ok(())
     }
 
     #[instrument]
@@ -959,8 +952,9 @@ impl agent_ttrpc::AgentService for AgentService {
         req: protocols::agent::CreateContainerRequest,
     ) -> ttrpc::Result<Empty> {
         trace_rpc_call!(ctx, "create_container", req);
-        is_allowed(&req).await?;
+        let policy_state = is_allowed_stateful(&req).await?;
         self.do_create_container(req).await.map_ttrpc_err(same)?;
+        policy_state.commit().await?;
         Ok(Empty::new())
     }
 
@@ -981,8 +975,9 @@ impl agent_ttrpc::AgentService for AgentService {
         req: protocols::agent::RemoveContainerRequest,
     ) -> ttrpc::Result<Empty> {
         trace_rpc_call!(ctx, "remove_container", req);
-        is_allowed(&req).await?;
+        let policy_state = is_allowed_stateful(&req).await?;
         self.do_remove_container(req).await.map_ttrpc_err(same)?;
+        policy_state.commit().await?;
         Ok(Empty::new())
     }
 
@@ -992,8 +987,9 @@ impl agent_ttrpc::AgentService for AgentService {
         req: protocols::agent::ExecProcessRequest,
     ) -> ttrpc::Result<Empty> {
         trace_rpc_call!(ctx, "exec_process", req);
-        is_allowed(&req).await?;
+        let policy_state = is_allowed_stateful(&req).await?;
         self.do_exec_process(req).await.map_ttrpc_err(same)?;
+        policy_state.commit().await?;
         Ok(Empty::new())
     }
 
@@ -1543,7 +1539,7 @@ impl agent_ttrpc::AgentService for AgentService {
         req: protocols::agent::CreateSandboxRequest,
     ) -> ttrpc::Result<Empty> {
         trace_rpc_call!(ctx, "create_sandbox", req);
-        is_allowed(&req).await?;
+        let policy_state = is_allowed_stateful(&req).await?;
 
         {
             let mut s = self.sandbox.lock().await;
@@ -1592,6 +1588,7 @@ impl agent_ttrpc::AgentService for AgentService {
             }
         }
 
+        policy_state.commit().await?;
         Ok(Empty::new())
     }
 

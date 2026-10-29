@@ -38,7 +38,7 @@ pub trait Rootfs: Send + Sync {
     async fn get_rootfs_mount(&self) -> Result<Vec<oci::Mount>>;
     async fn get_storage(&self) -> Option<Vec<Storage>>;
     async fn cleanup(&self, device_manager: &RwLock<DeviceManager>) -> Result<()>;
-    async fn get_device_id(&self) -> Result<Option<String>>;
+    async fn get_device_ids(&self) -> Result<Vec<String>>;
 }
 
 #[derive(Default)]
@@ -169,7 +169,7 @@ impl RootFsResource {
                     };
                     Ok(share_rootfs)
                 } else {
-                    Err(anyhow!("unsupported rootfs {:?}", &layer))
+                    Err(anyhow!("unsupported rootfs {:?}", layer))
                 }?;
                 inner.rootfs.push(rootfs.clone());
                 Ok(rootfs)

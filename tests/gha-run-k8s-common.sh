@@ -18,6 +18,15 @@ AZ_REGION="${AZ_REGION:-eastus2}"
 AZ_NODEPOOL_TAGS="${AZ_NODEPOOL_TAGS:-}"
 GENPOLICY_PULL_METHOD="${GENPOLICY_PULL_METHOD:-oci-distribution}"
 GH_PR_NUMBER="${GH_PR_NUMBER:-}"
+# Cluster network stack for kubeadm deployments: ipv4, ipv6 (single-stack
+# IPv6) or dual (IPv4 primary, IPv6 secondary).
+K8S_IP_FAMILY="${K8S_IP_FAMILY:-ipv4}"
+# CNI for kubeadm deployments: flannel or bridge. Defaults to flannel for ipv4
+# and bridge otherwise, as only bridge is set up for IPv6.
+if [[ -z "${K8S_CNI:-}" ]]; then
+	K8S_CNI="flannel"
+	[[ "${K8S_IP_FAMILY}" == "ipv4" ]] || K8S_CNI="bridge"
+fi
 HELM_DEFAULT_INSTALLATION="${HELM_DEFAULT_INSTALLATION:-false}"
 HELM_AGENT_HTTPS_PROXY="${HELM_AGENT_HTTPS_PROXY:-}"
 HELM_AGENT_NO_PROXY="${HELM_AGENT_NO_PROXY:-}"
@@ -251,14 +260,19 @@ function create_cluster() {
 }
 
 function install_bats() {
+	local bats_version
+	if command -v bats &>/dev/null && bats_version=$(bats --version); then
+		echo "${bats_version}"
+		if version_greater_than_equal "${bats_version#Bats }" "1.10.0"; then
+			return
+		fi
+	fi
+
 	source /etc/os-release
 	case "${ID}" in
 		ubuntu)
-			# Only jammy and older need bats fetched from somewhere else:
-			# their own universe carries one too old for these suites,
-			# while noble onwards already ships a new enough bats. Pulling
-			# noble's repo into a later release would be reaching backwards.
-			if dpkg --compare-versions "${VERSION_ID:-}" lt 24.04; then
+			# Only use the noble repository on Ubuntu 24.04.
+			if [[ "${VERSION_ID:-}" == "24.04" ]]; then
 				# Installing bats from the noble repo.
 				sudo apt install -y software-properties-common
 				sudo add-apt-repository 'deb http://archive.ubuntu.com/ubuntu/ noble universe'
@@ -492,10 +506,131 @@ function set_k8s_network_parameters() {
 	sudo sysctl -w net.bridge.bridge-nf-call-iptables=1
 	sudo sysctl -w net.ipv4.ip_forward=1
 	sudo sysctl -w net.bridge.bridge-nf-call-ip6tables=1
+
+	if k8s_has_ipv6; then
+		sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0
+		sudo sysctl -w net.ipv6.conf.default.disable_ipv6=0
+		sudo sysctl -w net.ipv6.conf.all.forwarding=1
+	fi
 }
 
 function disable_swap() {
 	sudo swapoff -a
+}
+
+# Addressing for the ipv6 and dual K8S_IP_FAMILY clusters. GitHub-hosted
+# runners have no routable IPv6, so the node gets a ULA address on a dummy
+# interface. Image pulls still go through the host's own uplink.
+k8s_node_ipv6_iface="kata-k8s-v6"
+k8s_node_ipv6="fd00:10:1::1"
+k8s_pod_subnet_ipv4="10.244.0.0/16"
+k8s_pod_subnet_ipv6="fd00:10:244::/56"
+k8s_service_subnet_ipv4="10.96.0.0/12"
+k8s_service_subnet_ipv6="fd00:10:96::/112"
+k8s_cni_subnet_ipv4="10.244.0.0/24"
+k8s_cni_subnet_ipv6="fd00:10:244::/64"
+
+function k8s_has_ipv4() {
+	[[ "${K8S_IP_FAMILY}" == "ipv4" || "${K8S_IP_FAMILY}" == "dual" ]]
+}
+
+function k8s_has_ipv6() {
+	[[ "${K8S_IP_FAMILY}" == "ipv6" || "${K8S_IP_FAMILY}" == "dual" ]]
+}
+
+function join_by_comma() {
+	local IFS=","
+	echo "$*"
+}
+
+function validate_k8s_ip_family() {
+	case "${K8S_IP_FAMILY}" in
+		ipv4|ipv6|dual) ;;
+		*) die "Unsupported K8S_IP_FAMILY=${K8S_IP_FAMILY}. Supported values: ipv4, ipv6, dual" ;;
+	esac
+
+	if k8s_has_ipv6 && [[ "${KUBERNETES}" != "kubeadm" && "${KUBERNETES}" != "vanilla" ]]; then
+		die "K8S_IP_FAMILY=${K8S_IP_FAMILY} is only supported with kubeadm, not ${KUBERNETES}"
+	fi
+
+	case "${K8S_CNI}" in
+		bridge) ;;
+		flannel)
+			if k8s_has_ipv6; then
+				die "K8S_CNI=flannel is only set up for K8S_IP_FAMILY=ipv4, not ${K8S_IP_FAMILY}"
+			fi
+			;;
+		*) die "Unsupported K8S_CNI=${K8S_CNI}. Supported values: flannel, bridge" ;;
+	esac
+}
+
+function setup_k8s_node_ipv6_address() {
+	ip link show "${k8s_node_ipv6_iface}" &>/dev/null || \
+		sudo ip link add "${k8s_node_ipv6_iface}" type dummy
+	sudo ip link set "${k8s_node_ipv6_iface}" up
+	sudo ip -6 addr replace "${k8s_node_ipv6}/64" dev "${k8s_node_ipv6_iface}" nodad
+}
+
+function get_k8s_node_ipv4() {
+	ip -4 route get 1.1.1.1 | awk '{ for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit } }'
+}
+
+# Accept pod traffic in FORWARD for one family; the runner's Docker install
+# sets the FORWARD policy to DROP.
+function allow_k8s_pod_forwarding() {
+	local iptables_cmd="$1"
+	local subnet="$2"
+	local direction
+
+	for direction in -s -d; do
+		sudo "${iptables_cmd}" -C FORWARD "${direction}" "${subnet}" -j ACCEPT 2>/dev/null || \
+			sudo "${iptables_cmd}" -I FORWARD "${direction}" "${subnet}" -j ACCEPT
+	done
+}
+
+# Flannel picks its interface from the default route, which the runners lack
+# for IPv6. A single node only needs a local bridge, so use the bridge plugin
+# shipped by kubernetes-cni. It does not connect pods across nodes.
+function deploy_k8s_bridge_cni() {
+	local -a ranges=()
+	local -a routes=()
+
+	if k8s_has_ipv4; then
+		ranges+=("[{\"subnet\": \"${k8s_cni_subnet_ipv4}\"}]")
+		routes+=('{"dst": "0.0.0.0/0"}')
+		allow_k8s_pod_forwarding iptables "${k8s_cni_subnet_ipv4}"
+	fi
+	if k8s_has_ipv6; then
+		ranges+=("[{\"subnet\": \"${k8s_cni_subnet_ipv6}\"}]")
+		routes+=('{"dst": "::/0"}')
+		allow_k8s_pod_forwarding ip6tables "${k8s_cni_subnet_ipv6}"
+	fi
+
+	sudo mkdir -p /etc/cni/net.d
+	cat <<EOF | sudo tee /etc/cni/net.d/10-kata-k8s-bridge.conflist
+{
+  "cniVersion": "1.0.0",
+  "name": "kata-k8s-bridge",
+  "plugins": [
+    {
+      "type": "bridge",
+      "bridge": "cni0",
+      "isGateway": true,
+      "ipMasq": true,
+      "hairpinMode": true,
+      "ipam": {
+        "type": "host-local",
+        "ranges": [$(join_by_comma "${ranges[@]}")],
+        "routes": [$(join_by_comma "${routes[@]}")]
+      }
+    },
+    {
+      "type": "portmap",
+      "capabilities": {"portMappings": true}
+    }
+  ]
+}
+EOF
 }
 
 # Deploys the latest k8s version, falling back to the previous minor if
@@ -556,18 +691,53 @@ function do_deploy_k8s() {
 
 	# Deploy k8s using kubeadm with CreateContainerRequest (CRI) timeout set to 600s,
 	# mainly for CoCo (Confidential Containers) tests (attestation, policy, image pull, VM start).
+	local local_api_endpoint=""
+	local kubelet_extra_args=""
+	local -a node_ips=()
+	local -a pod_subnets=()
+	local -a service_subnets=()
+	if k8s_has_ipv4; then
+		pod_subnets+=("${k8s_pod_subnet_ipv4}")
+		service_subnets+=("${k8s_service_subnet_ipv4}")
+	fi
+	if k8s_has_ipv6; then
+		setup_k8s_node_ipv6_address
+
+		if k8s_has_ipv4; then
+			local node_ipv4
+			node_ipv4="$(get_k8s_node_ipv4)"
+			[[ -n "${node_ipv4}" ]] || die "Failed to find the node's IPv4 address"
+			node_ips+=("${node_ipv4}")
+		else
+			local_api_endpoint="localAPIEndpoint:
+  advertiseAddress: \"${k8s_node_ipv6}\""
+		fi
+		node_ips+=("${k8s_node_ipv6}")
+		pod_subnets+=("${k8s_pod_subnet_ipv6}")
+		service_subnets+=("${k8s_service_subnet_ipv6}")
+
+		kubelet_extra_args="  kubeletExtraArgs:
+  - name: node-ip
+    value: \"$(join_by_comma "${node_ips[@]}")\""
+	fi
+	local networking
+	networking="  podSubnet: \"$(join_by_comma "${pod_subnets[@]}")\"
+  serviceSubnet: \"$(join_by_comma "${service_subnets[@]}")\""
+
 	local kubeadm_config
 	kubeadm_config="$(mktemp --tmpdir kubeadm-config.XXXXXX.yaml)"
 	cat <<EOF | tee "${kubeadm_config}"
 apiVersion: kubeadm.k8s.io/v1beta4
 kind: InitConfiguration
+${local_api_endpoint}
 nodeRegistration:
   criSocket: "unix:///run/containerd/containerd.sock"
+${kubelet_extra_args}
 ---
 apiVersion: kubeadm.k8s.io/v1beta4
 kind: ClusterConfiguration
 networking:
-  podSubnet: "10.244.0.0/16"
+${networking}
 ---
 apiVersion: kubelet.config.k8s.io/v1beta1
 kind: KubeletConfiguration
@@ -579,8 +749,11 @@ EOF
 	sudo cp -i /etc/kubernetes/admin.conf "${HOME}/.kube/config"
 	sudo chown "$(id -u):$(id -g)" "${HOME}/.kube/config"
 
-	# Deploy flannel
-	kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+	if [[ "${K8S_CNI}" == "flannel" ]]; then
+		kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+	else
+		deploy_k8s_bridge_cni
+	fi
 
 	# Untaint the node
 	kubectl taint nodes --all node-role.kubernetes.io/control-plane-
@@ -647,6 +820,8 @@ function deploy_vanilla_k8s() {
 
 function deploy_k8s() {
 	echo "::group::Deploying ${KUBERNETES}"
+
+	validate_k8s_ip_family
 
 	case "${KUBERNETES}" in
 		k0s) deploy_k0s ;;
@@ -817,8 +992,11 @@ function helm_helper() {
 	# NFD is vendored under charts/*.tgz; no helm dependency fetch needed.
 
 	# Create temporary values file for customization
-	# Start with values.yaml which has all shims enabled by default
-	# Use example files only for specific hypervisor types that need different configurations
+	# Start with values.yaml, which enables the shims that need no particular
+	# snapshotter or hardware. The shims that do need one ship in a
+	# try-kata-*.values.yaml profile instead, so pick that as the base when the
+	# hypervisor under test is one of them - the profile is what sets up its
+	# snapshotter and CRI configuration.
 	values_yaml=$(mktemp -t values_yaml.XXXXXX)
 
 	# Determine which values file to use as base
@@ -842,6 +1020,12 @@ function helm_helper() {
 				if is_confidential_runtime_class "${KATA_HYPERVISOR}"; then
 					if [[ -f "${helm_chart_dir}/try-kata-tee.values.yaml" ]]; then
 						base_values_file="${helm_chart_dir}/try-kata-tee.values.yaml"
+					fi
+				# Firecracker reads images from devmapper, and its profile is
+				# what maps the shim to that snapshotter.
+				elif is_firecracker_hypervisor "${KATA_HYPERVISOR}"; then
+					if [[ -f "${helm_chart_dir}/try-kata-fc.values.yaml" ]]; then
+						base_values_file="${helm_chart_dir}/try-kata-fc.values.yaml"
 					fi
 				fi
 				;;
@@ -932,6 +1116,11 @@ function helm_helper() {
 				if is_se_hypervisor "${shim}"; then
 					yq -i ".shims.${shim}.supportedArches = [\"s390x\"]" "${values_yaml}"
 				elif is_snp_hypervisor "${shim}" || is_tdx_hypervisor "${shim}" || is_confidential_gpu_hypervisor "${shim}"; then
+					yq -i ".shims.${shim}.supportedArches = [\"amd64\"]" "${values_yaml}"
+				# Firecracker is built for amd64 only, which is what
+				# try-kata-fc.values.yaml says; without this the fallback
+				# below would widen it to every architecture.
+				elif is_firecracker_hypervisor "${shim}"; then
 					yq -i ".shims.${shim}.supportedArches = [\"amd64\"]" "${values_yaml}"
 				# qemu-coco-dev-runtime-rs is checked explicitly because
 				# qemu-coco-dev (Go runtime) does not support arm64.

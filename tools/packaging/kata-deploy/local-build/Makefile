@@ -107,6 +107,7 @@ NVGPU_BASE_TARBALLS = \
 	busybox-tarball \
 	coco-guest-components-tarball \
 	$(PUBLISH_COMPONENT_TARBALLS) \
+	kata-ctl-tarball \
 	kernel-nvidia-gpu-tarball \
 	ovmf-sev-tarball \
 	ovmf-tdx-tarball \
@@ -124,6 +125,7 @@ NVGPU_BASE_TARBALLS = \
 	busybox-tarball \
 	coco-guest-components-tarball \
 	$(PUBLISH_COMPONENT_TARBALLS) \
+	kata-ctl-tarball \
 	kernel-nvidia-gpu-tarball \
 	ovmf-tarball \
 	pause-image-tarball \
@@ -137,6 +139,7 @@ endif
 NVGPU_FINAL_TARBALL_INPUTS = \
 	kata-deploy-static-kata-deploy-binary.tar.zst \
 	kata-deploy-static-nydus-snapshotter-for-coco-guest-pull.tar.zst \
+	kata-static-kata-ctl.tar.zst \
 	kata-static-kernel-nvidia-gpu.tar.zst \
 	kata-static-ovmf-sev.tar.zst \
 	kata-static-ovmf-tdx.tar.zst \
@@ -151,15 +154,16 @@ NVGPU_FINAL_TARBALL_INPUTS = \
 	kata-static-rootfs-image-nvidia-gpu-confidential.tar.zst \
 	kata-static-rootfs-image-nvidia.tar.zst \
 	kata-static-rootfs-image-nvidia-gpu-extension.tar.zst \
+	kata-static-rootfs-image-coco-extension.tar.zst \
 	kata-static-shim-v2-go.tar.zst \
 	kata-static-shim-v2-rust.tar.zst
 
 
 ifneq ($(NVGPU_BASE_TARBALLS),)
 nvgpu-tarball:
-	${MAKE} -f $(MK_PATH) kata-tarball \
+	MEASURED_ROOTFS=yes ${MAKE} -f $(MK_PATH) kata-tarball \
 		BASE_TARBALLS="$(NVGPU_BASE_TARBALLS)" \
-		BASE_SERIAL_TARBALLS="rootfs-image-nvidia-gpu-tarball rootfs-image-nvidia-gpu-confidential-tarball rootfs-image-nvidia-tarball" \
+		BASE_SERIAL_TARBALLS="rootfs-image-nvidia-gpu-tarball rootfs-image-nvidia-gpu-confidential-tarball rootfs-image-nvidia-tarball rootfs-image-nvidia-gpu-extension-tarball rootfs-image-coco-extension-tarball" \
 		FINAL_TARBALL_INPUTS="$(NVGPU_FINAL_TARBALL_INPUTS)" \
 		FINAL_TARBALL_MERGE_MODE=passthrough \
 		DEPS=

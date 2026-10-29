@@ -22,7 +22,7 @@ use crate::rootfs::HYBRID_ROOTFS_LOWER_DIR;
 use crate::{
     rootfs::ROOTFS,
     share_fs::{
-        do_get_guest_path, get_host_rw_shared_path, kata_guest_nydus_root_dir,
+        do_get_guest_path, do_get_host_path, get_host_rw_shared_path, kata_guest_nydus_root_dir,
         kata_guest_share_dir, NydusShareFs, ShareFs, ShareFsRootfsConfig, PASSTHROUGH_FS_DIR,
     },
 };
@@ -385,8 +385,8 @@ impl Rootfs for NydusRootfs {
         self.rootfs.clone().map(|rootfs| vec![rootfs])
     }
 
-    async fn get_device_id(&self) -> Result<Option<String>> {
-        Ok(None)
+    async fn get_device_ids(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
     }
 
     async fn cleanup(&self, _device_manager: &RwLock<DeviceManager>) -> Result<()> {
@@ -397,19 +397,25 @@ impl Rootfs for NydusRootfs {
                     "failed to umount rafs at {} with err {}", rafs_mnt, e
                 );
             }
-
-            let sn_shared_path = get_host_rw_shared_path(&self.sid)
-                .join(&self.cid)
-                .join(SNAPSHOT_DIR);
-            if sn_shared_path.exists() {
-                if let Err(e) = nix::mount::umount(&sn_shared_path) {
-                    warn!(
-                        sl!(),
-                        "failed to umount snapshot mount at {:?} with err {}", sn_shared_path, e
-                    );
-                }
-            }
         }
+
+        let sn_shared_path = if self.nydus_share_fs.is_some() {
+            get_host_rw_shared_path(&self.sid)
+                .join(&self.cid)
+                .join(SNAPSHOT_DIR)
+        } else {
+            PathBuf::from(do_get_host_path(
+                SNAPSHOT_DIR,
+                &self.sid,
+                &self.cid,
+                false,
+                false,
+            ))
+        };
+        // Both Nydus modes bind the snapshot directory, but inline mode
+        // places it under passthrough instead of the standalone share path.
+        kata_sys_util::mount::umount_all(&sn_shared_path, true)
+            .context("detach nydus snapshot bind mount")?;
 
         Ok(())
     }

@@ -39,13 +39,13 @@ impl ShimExecutor {
     pub(crate) fn write_address(&self, path: &Path, address: &Path) -> Result<()> {
         let file_path = &path.join("address");
         std::fs::write(file_path, address.as_os_str().as_bytes())
-            .context(Error::FileWrite(format!("{:?}", &file_path)))
+            .context(Error::FileWrite(format!("{:?}", file_path)))
     }
 
     pub(crate) fn write_pid_file(&self, path: &Path, pid: u32) -> Result<()> {
         let file_path = &path.join(SHIM_PID_FILE);
         std::fs::write(file_path, format!("{pid}"))
-            .context(Error::FileWrite(format!("{:?}", &file_path)))
+            .context(Error::FileWrite(format!("{:?}", file_path)))
     }
 
     // There may be a multi-container for a Pod, each container has a bundle path, we need to write
@@ -81,6 +81,12 @@ impl ShimExecutor {
                 .collect::<String>()
         )))
     }
+}
+
+/// Path of the socket file of a `unix://` address.
+pub(crate) fn socket_path(address: &Path) -> Result<PathBuf> {
+    let trim_path = address.strip_prefix("unix:").context("trim path")?;
+    Ok(Path::new("/").join(trim_path))
 }
 
 #[cfg(test)]
