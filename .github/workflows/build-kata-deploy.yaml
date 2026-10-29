@@ -1,0 +1,194 @@
+# Builds the kata-deploy image this deployment installs: the upstream image
+# of the release this branch is based on, with the Go and the Rust shims
+# rebuilt from this branch, which carries netkit-l2 support. Not an upstream
+# workflow; it exists only in this fork.
+#
+# Only the shims are rebuilt. The kernel, the hypervisors, the guest images
+# and the shim configurations are the upstream release's, unchanged: the
+# shim binaries are swapped inside the release's own component tarballs.
+name: fork | build the kata-deploy image
+
+on:
+  push:
+    branches:
+      - 'prod-*-netkit'
+    paths:
+      - 'src/runtime/**'
+      - 'src/runtime-rs/**'
+      - 'src/libs/**'
+      - 'src/dragonball/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'VERSION'
+      - '.github/workflows/build-kata-deploy.yaml'
+  workflow_dispatch:
+    inputs:
+      push:
+        description: Push the image to ghcr.io
+        type: boolean
+        default: true
+
+permissions: {}
+
+concurrency:
+  group: build-kata-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/kata-deploy
+
+jobs:
+  test:
+    name: test the netkit patches
+    if: ${{ github.repository == 'fivetime/kata-containers' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the toolchain versions
+        id: versions
+        run: |
+          echo "go=$(yq '.languages.golang.version' versions.yaml)" >> "$GITHUB_OUTPUT"
+          echo "rust=$(yq '.languages.rust.version' versions.yaml)" >> "$GITHUB_OUTPUT"
+
+      # The tests create netkit and TAP devices, so they run as root in a
+      # privileged container. The runner's kernel has netkit (6.7+); a test
+      # prints "skipped" when the kernel cannot create a netkit device.
+      - name: Test the Go runtime
+        run: |
+          docker run --rm --privileged -v "$PWD:/src" -w /src/src/runtime \
+            "golang:${{ steps.versions.outputs.go }}" \
+            go test ./virtcontainers/ -count=1 -v \
+              -run 'Netkit|Veth|NetworkPair|HasNoMACAddress'
+
+      - name: Test runtime-rs
+        run: |
+          docker run --rm --privileged -v "$PWD:/src" -w /src/src/runtime-rs \
+            "rust:${{ steps.versions.outputs.rust }}" bash -c '
+              set -e
+              apt-get -qq update && apt-get -qq install -y protobuf-compiler libseccomp-dev cmake
+              cargo test -p resource --lib -- --nocapture --test-threads=1 \
+                network::network_pair::tests network::utils::link'
+
+  build:
+    name: build and publish
+    needs: test
+    if: ${{ github.repository == 'fivetime/kata-containers' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      # The builder image is named after the last commit that touched the
+      # shim build scripts, so the history is needed to find it.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Record what this build is
+        id: what
+        run: |
+          version=$(cat VERSION)
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "base=quay.io/kata-containers/kata-deploy:${version}" >> "$GITHUB_OUTPUT"
+
+      # Upstream's own build of the shims, in upstream's builder image. The
+      # verity parameters it would write into the configurations are not
+      # available here; the configurations are taken from the release.
+      - name: Build the Go and the Rust shims
+        env:
+          RUNTIME_CHOICE: both
+          ARCH: x86_64
+          PUSH_TO_REGISTRY: "no"
+        run: |
+          export GO_VERSION=$(yq '.languages.golang.meta.newest-version' versions.yaml)
+          export RUST_VERSION=$(yq '.languages.rust.meta.newest-version' versions.yaml)
+          export DESTDIR="$PWD/shim-out"
+          mkdir -p "$DESTDIR"
+          tools/packaging/static-build/shim-v2/build.sh
+          ls -l shim-out/opt/kata/bin/containerd-shim-kata-v2 \
+                shim-out/opt/kata/runtime-rs/bin/containerd-shim-kata-v2
+
+      - name: Check that both shims carry the netkit support
+        run: |
+          for shim in shim-out/opt/kata/bin/containerd-shim-kata-v2 \
+                      shim-out/opt/kata/runtime-rs/bin/containerd-shim-kata-v2; do
+            grep -aq 'netkit L3 mode is not supported' "$shim" ||
+              { echo "::error::$shim lacks the netkit support"; exit 1; }
+            "$shim" --version
+          done
+
+      # The release's tarballs are taken from its image, the shims are
+      # replaced in them, and nothing else changes.
+      - name: Swap the shims into the release's tarballs
+        run: |
+          set -o pipefail
+          base="${{ steps.what.outputs.base }}"
+          docker pull "$base"
+          id=$(docker create "$base")
+          mkdir -p orig tarballs
+          for c in shim-v2-go shim-v2-rust; do
+            docker cp "$id:/opt/kata-artifacts/tarballs/kata-static-$c.tar.zst" orig/
+          done
+          docker rm "$id"
+
+          # repack COMPONENT FILE... swaps each FILE, a path under /, from
+          # shim-out into the component's tarball, where it must exist.
+          repack() {
+            local c=$1 dir="tree-$1" f
+            shift
+            mkdir -p "$dir"
+            zstd -dc "orig/kata-static-$c.tar.zst" | tar -xpf - -C "$dir"
+            for f in "$@"; do
+              test -f "$dir/$f" || { echo "::error::$f is not in $c"; exit 1; }
+              install -m 0755 "shim-out/$f" "$dir/$f"
+            done
+            tar -C "$dir" --owner=0 --group=0 --numeric-owner -cf - . |
+              zstd -19 -T0 -q -o "tarballs/kata-static-$c.tar.zst"
+          }
+          # kata-runtime is rebuilt too: `kata-runtime check` uses the same
+          # network code as the shim.
+          repack shim-v2-go \
+            opt/kata/bin/containerd-shim-kata-v2 opt/kata/bin/kata-runtime
+          repack shim-v2-rust \
+            opt/kata/runtime-rs/bin/containerd-shim-kata-v2
+
+          # Every other file in the tarballs is the release's.
+          for c in shim-v2-go shim-v2-rust; do
+            diff <(zstd -dc "orig/kata-static-$c.tar.zst" | tar -tf - | sort) \
+                 <(zstd -dc "tarballs/kata-static-$c.tar.zst" | tar -tf - | sort)
+          done
+          ls -l orig tarballs
+
+      - name: Build the image
+        run: |
+          cat > Dockerfile.netkit <<EOF
+          FROM ${{ steps.what.outputs.base }}
+          COPY tarballs/ /opt/kata-artifacts/tarballs/
+          EOF
+          docker build -f Dockerfile.netkit \
+            --label org.opencontainers.image.source=https://github.com/${{ github.repository }} \
+            --label org.opencontainers.image.revision=${{ github.sha }} \
+            --label org.opencontainers.image.base.name=${{ steps.what.outputs.base }} \
+            -t "${IMAGE}:${{ steps.what.outputs.version }}-netkit-${{ steps.what.outputs.commit }}" \
+            -t "${IMAGE}:${{ steps.what.outputs.version }}-netkit" .
+
+      - name: Push the image
+        if: ${{ github.event_name == 'push' || inputs.push }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "${IMAGE}:${{ steps.what.outputs.version }}-netkit-${{ steps.what.outputs.commit }}"
+          docker push "${IMAGE}:${{ steps.what.outputs.version }}-netkit"
+          {
+            echo "### kata-deploy image"
+            echo
+            echo "\`${IMAGE}:${{ steps.what.outputs.version }}-netkit-${{ steps.what.outputs.commit }}\`"
+            echo
+            echo "Base: \`${{ steps.what.outputs.base }}\`, with both shims rebuilt from \`${{ github.ref_name }}\` at ${{ github.sha }}."
+          } >> "$GITHUB_STEP_SUMMARY"
