@@ -3,9 +3,11 @@
 # rebuilt from this branch, which carries netkit-l2 support. Not an upstream
 # workflow; it exists only in this fork.
 #
-# Only the shims are rebuilt. The kernel, the hypervisors, the guest images
-# and the shim configurations are the upstream release's, unchanged: the
-# shim binaries are swapped inside the release's own component tarballs.
+# Only the shims are rebuilt, and the guest agent in the guest image is the
+# fork's (AGENT_RELEASE, built by build-guest-agent.yaml from a prod-*-agent
+# branch). The kernel, the hypervisors, the rest of the guest image and the
+# shim configurations are the upstream release's, unchanged: the binaries
+# are swapped inside the release's own component tarballs.
 name: fork | build the kata-deploy image
 
 on:
@@ -36,6 +38,10 @@ concurrency:
 
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/kata-deploy
+  # The guest agent release to put in the guest image, and the tag suffix
+  # saying so: an image without the fork's agent was tagged "-netkit".
+  AGENT_RELEASE: guest-agent-prod-4.3.1-agent-0a64463
+  FLAVOR: netkit-agent
 
 jobs:
   test:
@@ -164,6 +170,67 @@ jobs:
           done
           ls -l orig tarballs
 
+      # The guest image is an ext4 filesystem in a partitioned disk image,
+      # without dm-verity, so the agent is replaced in place through a loop
+      # device. Only the image kata-containers.img points to is changed: the
+      # initrd and the confidential and GPU images keep the release's agent,
+      # and no configuration this deployment enables uses them.
+      - name: Swap the fork's guest agent into the guest image
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -o pipefail
+          gh release download "$AGENT_RELEASE" -R "${{ github.repository }}" \
+            -p kata-agent -p kata-agent.sha256 -D agent
+          (cd agent && sha256sum -c kata-agent.sha256)
+          chmod 0755 agent/kata-agent
+          want=$(agent/kata-agent --version)
+          echo "$want"
+
+          base="${{ steps.what.outputs.base }}"
+          id=$(docker create "$base")
+          docker cp "$id:/opt/kata-artifacts/tarballs" release-tarballs
+          docker rm "$id"
+          ls -l release-tarballs
+          c=rootfs-image
+          tb="release-tarballs/kata-static-$c.tar.zst"
+          test -f "$tb" || { echo "::error::no $tb in $base"; exit 1; }
+          mkdir -p "orig" "tree-$c"
+          cp "$tb" orig/
+          zstd -dc "$tb" | sudo tar -xpf - -C "tree-$c"
+          share="tree-$c/opt/kata/share/kata-containers"
+          ls -l "$share"
+          img="$share/$(readlink "$share/kata-containers.img")"
+          test -f "$img" || { echo "::error::kata-containers.img points to nothing"; exit 1; }
+          echo "guest image: $img"
+
+          loop=$(sudo losetup -P --find --show "$img")
+          lsblk "$loop"
+          part="${loop}p1"
+          test -b "$part" || part="$loop"
+          sudo mkdir -p /mnt/guest
+          sudo mount "$part" /mnt/guest
+          test -f /mnt/guest/usr/bin/kata-agent ||
+            { echo "::error::no /usr/bin/kata-agent in the guest image"; exit 1; }
+          echo "release agent: $(sudo /mnt/guest/usr/bin/kata-agent --version 2>&1 || true)"
+          sudo install -m 0755 agent/kata-agent /mnt/guest/usr/bin/kata-agent
+          got=$(sudo /mnt/guest/usr/bin/kata-agent --version)
+          sudo sha256sum /mnt/guest/usr/bin/kata-agent
+          sudo umount /mnt/guest
+          sudo losetup -d "$loop"
+          test "$got" = "$want" || { echo "::error::guest agent is \"$got\", not \"$want\""; exit 1; }
+
+          sudo tar -C "tree-$c" --owner=0 --group=0 --numeric-owner -cf - . |
+            zstd -19 -T0 -q -o "tarballs/kata-static-$c.tar.zst"
+          diff <(zstd -dc "orig/kata-static-$c.tar.zst" | tar -tf - | sort) \
+               <(zstd -dc "tarballs/kata-static-$c.tar.zst" | tar -tf - | sort)
+          {
+            echo "### Guest agent"
+            echo
+            echo "\`$AGENT_RELEASE\` in \`${img#tree-$c}\`: $want"
+          } >> "$GITHUB_STEP_SUMMARY"
+          ls -l tarballs
+
       - name: Build the image
         run: |
           cat > Dockerfile.netkit <<EOF
@@ -174,8 +241,8 @@ jobs:
             --label org.opencontainers.image.source=https://github.com/${{ github.repository }} \
             --label org.opencontainers.image.revision=${{ github.sha }} \
             --label org.opencontainers.image.base.name=${{ steps.what.outputs.base }} \
-            -t "${IMAGE}:${{ steps.what.outputs.version }}-netkit-${{ steps.what.outputs.commit }}" \
-            -t "${IMAGE}:${{ steps.what.outputs.version }}-netkit" .
+            -t "${IMAGE}:${{ steps.what.outputs.version }}-${{ env.FLAVOR }}-${{ steps.what.outputs.commit }}" \
+            -t "${IMAGE}:${{ steps.what.outputs.version }}-${{ env.FLAVOR }}" .
 
       - name: Push the image
         if: ${{ github.event_name == 'push' || inputs.push }}
@@ -183,12 +250,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          docker push "${IMAGE}:${{ steps.what.outputs.version }}-netkit-${{ steps.what.outputs.commit }}"
-          docker push "${IMAGE}:${{ steps.what.outputs.version }}-netkit"
+          docker push "${IMAGE}:${{ steps.what.outputs.version }}-${{ env.FLAVOR }}-${{ steps.what.outputs.commit }}"
+          docker push "${IMAGE}:${{ steps.what.outputs.version }}-${{ env.FLAVOR }}"
           {
             echo "### kata-deploy image"
             echo
-            echo "\`${IMAGE}:${{ steps.what.outputs.version }}-netkit-${{ steps.what.outputs.commit }}\`"
+            echo "\`${IMAGE}:${{ steps.what.outputs.version }}-${{ env.FLAVOR }}-${{ steps.what.outputs.commit }}\`"
             echo
-            echo "Base: \`${{ steps.what.outputs.base }}\`, with both shims rebuilt from \`${{ github.ref_name }}\` at ${{ github.sha }}."
+            echo "Base: \`${{ steps.what.outputs.base }}\`, with the guest agent from \`$AGENT_RELEASE\` and both shims rebuilt from \`${{ github.ref_name }}\` at ${{ github.sha }}."
           } >> "$GITHUB_STEP_SUMMARY"
