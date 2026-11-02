@@ -470,26 +470,31 @@ pub fn create_dir_all_with_inherit_owner<P: AsRef<Path>>(path: P, perm: u32) -> 
         current_path.push(p);
         let current = current_path.as_path();
 
-        match stat::stat(current) {
-            Ok(s) => {
-                if !current.is_dir() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotADirectory,
-                        format!("{} exists but is not a directory", current.display()),
-                    ));
+        let existing = match stat::stat(current) {
+            Err(nix::Error::ENOENT) => match std::fs::create_dir(current) {
+                Ok(()) => {
+                    set_permissions(current, Permissions::from_mode(perm))?;
+                    chown(current, Some(uid), Some(gid))?;
+                    continue;
                 }
-                uid = Uid::from_raw(s.st_uid);
-                gid = Gid::from_raw(s.st_gid);
-            }
-            Err(nix::Error::ENOENT) => {
-                std::fs::create_dir(current)?;
-                set_permissions(current, Permissions::from_mode(perm))?;
-                chown(current, Some(uid), Some(gid))?;
-            }
-            Err(e) => {
-                return Err(io::Error::from_raw_os_error(e as i32));
-            }
+                // Something else created it since the stat: the shim's
+                // management server creates the sandbox directory from another
+                // task, other shims create the directories they all share.
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => stat::stat(current),
+                Err(e) => return Err(e),
+            },
+            result => result,
+        };
+
+        let s = existing.map_err(|e| io::Error::from_raw_os_error(e as i32))?;
+        if !current.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                format!("{} exists but is not a directory", current.display()),
+            ));
         }
+        uid = Uid::from_raw(s.st_uid);
+        gid = Gid::from_raw(s.st_gid);
     }
 
     Ok(())
@@ -798,6 +803,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
     use std::path::{Path, PathBuf};
+    use std::sync::Barrier;
+    use std::thread;
 
     use nix::unistd::chown;
     use nix::unistd::geteuid;
@@ -1193,6 +1200,34 @@ mod tests {
         assert!(serialized.contains(r#""type":"#));
         assert!(serialized.contains(r#""cid":"#));
         assert!(serialized.contains(r#""port":"#));
+    }
+
+    #[test]
+    fn test_mkdir_all_with_inherited_owner_concurrent() {
+        const THREADS: usize = 8;
+
+        for _ in 0..500 {
+            let tmp = TempDir::new().expect("create tmp");
+            let target = tmp.path().join("foo").join("bar");
+            let barrier = Barrier::new(THREADS);
+
+            thread::scope(|s| {
+                let handles: Vec<_> = (0..THREADS)
+                    .map(|_| {
+                        s.spawn(|| {
+                            barrier.wait();
+                            create_dir_all_with_inherit_owner(&target, 0o750)
+                        })
+                    })
+                    .collect();
+
+                for handle in handles {
+                    handle.join().unwrap().expect("mkdir -p target");
+                }
+            });
+
+            assert!(target.is_dir());
+        }
     }
 
     #[test]
