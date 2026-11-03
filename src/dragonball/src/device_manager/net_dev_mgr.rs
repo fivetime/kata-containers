@@ -18,11 +18,17 @@
 use std::convert::TryInto;
 use std::sync::Arc;
 
+#[cfg(feature = "host-device")]
+use dbs_pci::VirtioPciDevice;
 use dbs_utils::net::MacAddr;
 use dbs_utils::rate_limiter::BucketUpdate;
 use dbs_virtio_devices as virtio;
 use dbs_virtio_devices::Error as VirtioError;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "host-device")]
+use virtio_queue::QueueSync;
+#[cfg(feature = "host-device")]
+use vm_memory::GuestRegionMmap;
 
 use crate::address_space_manager::GuestAddressSpaceImpl;
 #[cfg(target_arch = "x86_64")]
@@ -248,6 +254,19 @@ impl NetworkInterfaceConfig {
         (0..self.num_queues()).map(|_| queue_size).collect()
     }
 
+    /// Nova Kata: vhost-net is a PCI device with its own MSI-X vectors. On the
+    /// MMIO bus every interrupt makes the guest read and acknowledge each
+    /// device sharing the line, an exit to this VMM per access. The in-VMM
+    /// virtio-net stays there: its rate limiter patch and snapshot find it on
+    /// that bus.
+    fn use_pci_bus(&self) -> bool {
+        #[cfg(all(feature = "vhost-net", feature = "host-device"))]
+        if matches!(self.backend, Backend::Vhost(_)) {
+            return true;
+        }
+        false
+    }
+
     /// Whether the device uses the generic irq, defaulting per backend.
     fn use_generic_irq(&self) -> bool {
         #[allow(unused_mut, unused_assignments)]
@@ -446,15 +465,10 @@ impl NetworkDeviceMgr {
 
             match Self::create_device(&config, &mut ctx) {
                 Ok(device) => {
-                    let dev = DeviceManager::create_mmio_virtio_device(
-                        device,
-                        &mut ctx,
-                        config.use_shared_irq.unwrap_or(self.use_shared_irq),
-                        config.use_generic_irq(),
-                    )
-                    .map_err(NetworkDeviceError::DeviceManager)?;
-                    ctx.insert_hotplug_mmio_device(&dev, None)
+                    let use_shared_irq = config.use_shared_irq.unwrap_or(self.use_shared_irq);
+                    let dev = Self::create_transport(&config, device, &mut ctx, use_shared_irq)
                         .map_err(NetworkDeviceError::DeviceManager)?;
+                    Self::insert_hotplug(&ctx, &dev).map_err(NetworkDeviceError::DeviceManager)?;
                     // live-upgrade need save/restore device from info.device.
                     self.info_list[device_index].set_device(dev);
                 }
@@ -488,7 +502,8 @@ impl NetworkDeviceMgr {
             .device
             .as_ref()
             .ok_or_else(|| NetworkDeviceError::InvalidIfaceId(iface_id.to_owned()))?;
-        if device.as_any().downcast_ref::<DbsMmioV2Device>().is_none() {
+        let is_pci = Self::is_pci_device(device);
+        if !is_pci && device.as_any().downcast_ref::<DbsMmioV2Device>().is_none() {
             return Err(NetworkDeviceError::InvalidIfaceId(iface_id.to_owned()));
         }
 
@@ -509,6 +524,12 @@ impl NetworkDeviceMgr {
                     log::debug!("this arm should only be triggered under test");
                 }
             }));
+        #[cfg(feature = "host-device")]
+        if is_pci {
+            return ctx
+                .remove_hotplug_pci_device(device, callback)
+                .map_err(NetworkDeviceError::DeviceManager);
+        }
         ctx.remove_hotplug_mmio_device(device, callback)
             .map_err(NetworkDeviceError::DeviceManager)
     }
@@ -532,8 +553,7 @@ impl NetworkDeviceMgr {
             .ok_or_else(|| NetworkDeviceError::InvalidIfaceId(iface_id.to_owned()))?;
         slog::info!(ctx.logger(), "remove network device: {}", info.config.id());
         if let Some(device) = info.device.take() {
-            DeviceManager::destroy_mmio_device(device, &mut ctx)
-                .map_err(NetworkDeviceError::DeviceManager)?;
+            Self::destroy_device(device, &mut ctx).map_err(NetworkDeviceError::DeviceManager)?;
         }
         Ok(())
     }
@@ -620,17 +640,69 @@ impl NetworkDeviceMgr {
             );
 
             let device = Self::create_device(&info.config, ctx)?;
-            let device = DeviceManager::create_mmio_virtio_device(
-                device,
-                ctx,
-                info.config.use_shared_irq.unwrap_or(self.use_shared_irq),
-                info.config.use_generic_irq(),
-            )
-            .map_err(NetworkDeviceError::RegisterNetDevice)?;
+            let use_shared_irq = info.config.use_shared_irq.unwrap_or(self.use_shared_irq);
+            let device = Self::create_transport(&info.config, device, ctx, use_shared_irq)
+                .map_err(NetworkDeviceError::RegisterNetDevice)?;
             info.set_device(device);
         }
 
         Ok(())
+    }
+
+    /// Put a backend device on the bus its configuration asks for.
+    fn create_transport(
+        config: &NetworkInterfaceConfig,
+        device: DbsVirtioDevice,
+        ctx: &mut DeviceOpContext,
+        use_shared_irq: bool,
+    ) -> std::result::Result<Arc<dyn dbs_device::DeviceIo>, DeviceMgrError> {
+        #[cfg(feature = "host-device")]
+        if config.use_pci_bus() {
+            return DeviceManager::create_virtio_pci_device(device, ctx, config.use_generic_irq());
+        }
+        DeviceManager::create_mmio_virtio_device(
+            device,
+            ctx,
+            use_shared_irq,
+            config.use_generic_irq(),
+        )
+    }
+
+    /// Tell the running guest of a device on either bus.
+    fn insert_hotplug(
+        ctx: &DeviceOpContext,
+        device: &Arc<dyn dbs_device::DeviceIo>,
+    ) -> std::result::Result<(), DeviceMgrError> {
+        #[cfg(feature = "host-device")]
+        if Self::is_pci_device(device) {
+            return ctx.insert_hotplug_pci_device(device, None).map(|_| ());
+        }
+        ctx.insert_hotplug_mmio_device(device, None)
+    }
+
+    fn is_pci_device(device: &Arc<dyn dbs_device::DeviceIo>) -> bool {
+        #[cfg(feature = "host-device")]
+        if device
+            .as_any()
+            .downcast_ref::<VirtioPciDevice<GuestAddressSpaceImpl, QueueSync, GuestRegionMmap>>()
+            .is_some()
+        {
+            return true;
+        }
+        let _ = device;
+        false
+    }
+
+    /// Destroy a device on either bus.
+    fn destroy_device(
+        device: Arc<dyn dbs_device::DeviceIo>,
+        ctx: &mut DeviceOpContext,
+    ) -> std::result::Result<(), DeviceMgrError> {
+        if Self::is_pci_device(&device) {
+            DeviceManager::destroy_virtio_device(device, ctx)
+        } else {
+            DeviceManager::destroy_mmio_device(device, ctx)
+        }
     }
 
     /// Create the backing device for `cfg`, dispatching on its backend.
@@ -764,7 +836,7 @@ impl NetworkDeviceMgr {
         while let Some(mut info) = self.info_list.pop() {
             slog::info!(ctx.logger(), "remove network device: {}", info.config.id());
             if let Some(device) = info.device.take() {
-                if let Err(e) = DeviceManager::destroy_mmio_device(device, ctx) {
+                if let Err(e) = Self::destroy_device(device, ctx) {
                     slog::error!(
                         ctx.logger(),
                         "failed to destroy network device, continuing teardown";
@@ -1103,6 +1175,36 @@ mod tests {
             .net_manager
             .attach_devices(&mut device_op_ctx)
             .is_ok());
+
+        // Nova Kata: the device has its own vectors, on the PCI bus.
+        #[cfg(feature = "host-device")]
+        {
+            let info = &vm.device_manager().net_manager.info_list[0];
+            let device = info.device.as_ref().unwrap();
+            assert!(NetworkDeviceMgr::is_pci_device(device));
+        }
+    }
+
+    #[test]
+    fn test_only_vhost_net_is_on_the_pci_bus() {
+        #[cfg(feature = "virtio-net")]
+        {
+            let netif = net_config(
+                Backend::Virtio(virtio_backend_config("id_1", "dev1")),
+                "01:23:45:67:89:0a",
+                2,
+            );
+            assert!(!netif.use_pci_bus());
+        }
+        #[cfg(all(feature = "vhost-net", feature = "host-device"))]
+        {
+            let netif = net_config(
+                Backend::Vhost(virtio_backend_config("id_1", "dev1")),
+                "01:23:45:67:89:0a",
+                2,
+            );
+            assert!(netif.use_pci_bus());
+        }
     }
 
     #[cfg(feature = "vhost-net")]

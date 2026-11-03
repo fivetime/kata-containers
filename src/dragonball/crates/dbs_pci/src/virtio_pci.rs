@@ -1053,9 +1053,11 @@ impl<
         if self.device_activated.load(Ordering::SeqCst) && self.is_driver_init() {
             let mut device = self.device();
             if let Err(e) = device.reset() {
-                error!("Attempt to reset device when not implemented or reset error in underlying device, err: {e:?}");
-                let mut config = self.common_config();
-                config.driver_status = DEVICE_FAILED as u8;
+                // Nova Kata (ADR-044), as the MMIO transport: a backend that
+                // knows no reset, as vhost-net, stays as it is. The status
+                // stays 0: the guest's driver waits for it while it releases
+                // the device, and a failed status would hold it there for good.
+                warn!("device stays as it is, it was not reset: {e:?}");
             } else {
                 info!("Successfully reset device triggered due to the failure of activation");
                 self.device_activated.store(false, Ordering::SeqCst);
@@ -1074,6 +1076,10 @@ impl<
     }
 
     pub fn remove(&self) {
+        // Nova Kata (ADR-044): a backend that knows no reset still holds its
+        // queues' notifications at this address, and the next device here
+        // would never be told of its own requests.
+        self.unregister_ioevent();
         self.device().remove();
     }
 }
@@ -1575,9 +1581,10 @@ pub(crate) mod tests {
         assert_eq!(get_driver_status(&mut d), 0x8f);
         assert!(d.device_activated.load(Ordering::SeqCst));
 
-        // Backend driver doesn't support reset
+        // A backend that knows no reset stays as it is, and the guest's driver
+        // that waits for the status to clear is not held there.
         set_driver_status(&mut d, 0x0_u8);
-        assert_eq!(get_driver_status(&mut d), DEVICE_FAILED as u8);
+        assert_eq!(get_driver_status(&mut d), 0);
         assert!(d.device_activated.load(Ordering::SeqCst));
     }
 
@@ -1609,6 +1616,10 @@ pub(crate) mod tests {
         assert!(!d.ioevent_registered.load(Ordering::SeqCst));
         d.register_ioevent().unwrap();
         assert!(d.ioevent_registered.load(Ordering::SeqCst));
+        // A backend that knows no reset never gave them up: a device removed
+        // leaves its address free for the next one's notifications.
+        d.remove();
+        assert!(!d.ioevent_registered.load(Ordering::SeqCst));
     }
 
     #[test]
