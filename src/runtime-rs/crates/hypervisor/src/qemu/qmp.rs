@@ -1862,7 +1862,7 @@ impl Qmp {
                 "scsi-hd",
                 blkdev_add_args,
             )?;
-            self.set_block_io_limits(&node_name, io_limits)?;
+            self.set_block_io_limits(&node_name, &node_name, io_limits)?;
 
             info!(
                 sl!(),
@@ -1921,7 +1921,8 @@ impl Qmp {
                 }
                 return Err(e);
             }
-            if let Err(e) = self.set_block_io_limits(&node_name, io_limits) {
+            let backend = virtio_block_backend(&node_name);
+            if let Err(e) = self.set_block_io_limits(&node_name, &backend, io_limits) {
                 if let Some(ref mut sub) = self.ccw_subchannel {
                     let _ = sub.remove_device(&node_name);
                 }
@@ -1998,7 +1999,8 @@ impl Qmp {
                 block_driver,
                 blkdev_add_args,
             )?;
-            self.set_block_io_limits(&node_name, io_limits)?;
+            let backend = virtio_block_backend(&node_name);
+            self.set_block_io_limits(&node_name, &backend, io_limits)?;
 
             let pci_path = match self.get_device_by_qdev_id(&node_name) {
                 Ok(path) => path,
@@ -2024,15 +2026,20 @@ impl Qmp {
     /// root). The group belongs to the device's block backend and goes with
     /// device_del. If the limits cannot be set the device is removed again
     /// and the attachment fails: it never stays without its limits.
+    ///
+    /// `backend` is what holds the block backend: a SCSI disk itself, or the
+    /// child of a virtio device's proxy, which has none of its own.
     fn set_block_io_limits(
         &mut self,
         node_name: &str,
+        backend: &str,
         io_limits: Option<&BlockIoLimits>,
     ) -> Result<()> {
         let Some(limits) = io_limits else {
             return Ok(());
         };
-        let throttle = block_io_throttle(node_name, limits);
+        let mut throttle = block_io_throttle(node_name, limits);
+        throttle.id = Some(backend.to_owned());
         info!(sl!(), "set_block_io_limits(): {:?}", throttle);
         let error = match self.qmp.execute(&qmp::block_set_io_throttle(throttle)) {
             Ok(_) => return Ok(()),
@@ -2388,6 +2395,14 @@ fn block_io_throttle(qdev_id: &str, limits: &BlockIoLimits) -> qmp::BlockIOThrot
 #[cfg(test)]
 mod nova_volume_qos_tests {
     use super::*;
+
+    #[test]
+    fn a_virtio_disks_limits_go_to_its_backend() {
+        assert_eq!(
+            virtio_block_backend("drive-3"),
+            "/machine/peripheral/drive-3/virtio-backend"
+        );
+    }
     use std::collections::HashMap;
 
     fn limits(pairs: &[(&str, &str)]) -> BlockIoLimits {
@@ -2447,6 +2462,13 @@ mod nova_volume_qos_tests {
             })
         );
     }
+}
+
+/// The QOM path of what holds a virtio disk's block backend, as libvirt names
+/// it: QEMU answers the proxy's id with "Device does not have a block device
+/// backend".
+fn virtio_block_backend(qdev_id: &str) -> String {
+    format!("/machine/peripheral/{qdev_id}/virtio-backend")
 }
 
 /// Generate a blockdev node name based on the given index.
