@@ -17,7 +17,7 @@ use hypervisor::{
         device_manager::{do_handle_device, get_block_device_info, DeviceManager},
         DeviceConfig, DeviceType,
     },
-    BlockConfigModern, BlockDeviceAio,
+    BlockConfigModern, BlockDeviceAio, BlockIoLimits, VOLUME_QOS_PREFIX,
 };
 use kata_types::config::hypervisor::VIRTIO_PMEM;
 use kata_types::fs::VM_ROOTFS_FILESYSTEM_XFS;
@@ -42,6 +42,31 @@ pub(crate) fn root_volume_serial(annotations: &HashMap<String, String>) -> Strin
         .unwrap_or_default()
 }
 
+/// Nova Kata (ADR-059): the limits of the root's device, as JSON of libvirt's
+/// keys and their values, named by the gateway from the flavor or the volume.
+pub(crate) const ROOT_IO_LIMITS_ANNOTATION: &str = "io.openstack.nova.kata.root-io-limits.v1";
+
+/// The limits an annotation names, under the rules of a volume's; none without
+/// it. What cannot be read fails the container: the root is not given unlimited.
+pub(crate) fn root_io_limits(
+    annotations: &HashMap<String, String>,
+) -> Result<Option<BlockIoLimits>> {
+    let Some(value) = annotations.get(ROOT_IO_LIMITS_ANNOTATION) else {
+        return Ok(None);
+    };
+    let limits: HashMap<String, u64> =
+        serde_json::from_str(value).context("read the root's limits")?;
+    let metadata = limits
+        .into_iter()
+        .map(|(key, value)| (format!("{VOLUME_QOS_PREFIX}{key}"), value.to_string()))
+        .collect();
+    let limits = BlockIoLimits::from_volume_metadata(&metadata)?;
+    if limits.is_none() {
+        return Err(anyhow!("the annotation of the root's limits names none"));
+    }
+    Ok(limits)
+}
+
 pub(crate) struct BlockRootfs {
     guest_path: String,
     device_id: String,
@@ -57,6 +82,7 @@ impl BlockRootfs {
         dev_id: u64,
         rootfs: &Mount,
         serial: String,
+        io_limits: Option<BlockIoLimits>,
     ) -> Result<Self> {
         let container_path = do_get_guest_path(ROOTFS, cid, false, false);
         let host_path = do_get_host_path(ROOTFS, sid, cid, false, false);
@@ -78,6 +104,7 @@ impl BlockRootfs {
             logical_sector_size: blkdev_info.block_device_logical_sector_size,
             physical_sector_size: blkdev_info.block_device_physical_sector_size,
             serial_override: serial,
+            io_limits,
             ..Default::default()
         };
 
@@ -202,8 +229,31 @@ pub(crate) fn is_block_rootfs(m: &Mount) -> Option<(u64, Mount)> {
 
 #[cfg(test)]
 mod nova_root_serial_tests {
-    use super::{root_volume_serial, ROOT_VOLUME_ANNOTATION};
+    use super::{root_io_limits, root_volume_serial, ROOT_IO_LIMITS_ANNOTATION, ROOT_VOLUME_ANNOTATION};
     use std::collections::HashMap;
+
+    #[test]
+    fn nova_root_limits_are_read_as_a_volumes() {
+        let mut annotations = HashMap::new();
+        assert_eq!(root_io_limits(&annotations).unwrap(), None);
+        annotations.insert(
+            ROOT_IO_LIMITS_ANNOTATION.to_string(),
+            r#"{"total_bytes_sec":8388608,"total_iops_sec":50}"#.to_string(),
+        );
+        let limits = root_io_limits(&annotations).unwrap().unwrap();
+        assert_eq!(limits.total_bytes_sec, Some(8388608));
+        assert_eq!(limits.total_iops_sec, Some(50));
+        for bad in [
+            "not json",
+            "{}",
+            r#"{"unknown":1}"#,
+            r#"{"total_bytes_sec":0}"#,
+            r#"{"total_bytes_sec":1,"read_bytes_sec":1}"#,
+        ] {
+            annotations.insert(ROOT_IO_LIMITS_ANNOTATION.to_string(), bad.to_string());
+            assert!(root_io_limits(&annotations).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn nova_root_serial_is_the_cinder_volumes_or_none() {

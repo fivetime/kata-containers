@@ -139,6 +139,7 @@ impl RootFsResource {
                             dev_id,
                             &layer,
                             block_rootfs::root_volume_serial(annotations),
+                            block_rootfs::root_io_limits(annotations)?,
                         )
                         .await
                         .context("new block rootfs")?,
